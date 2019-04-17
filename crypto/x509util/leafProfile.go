@@ -58,7 +58,7 @@ func defaultLeafTemplate(sub pkix.Name, iss pkix.Name) *x509.Certificate {
 		IsCA:      false,
 		NotBefore: notBefore,
 		NotAfter:  notBefore.Add(DefaultCertValidity),
-		KeyUsage:  x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		KeyUsage:  x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature | x509.KeyUsageDataEncipherment | x509.KeyUsageContentCommitment,
 		ExtKeyUsage: []x509.ExtKeyUsage{
 			x509.ExtKeyUsageServerAuth,
 			x509.ExtKeyUsageClientAuth,

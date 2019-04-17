@@ -3,6 +3,7 @@ package x509util
 import (
 	"crypto"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha1"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -213,6 +214,23 @@ func WithHosts(hosts string) WithOption {
 	}
 }
 
+// WithSHA1RSA hardcodes the SHA1WithRSA signature algorithm if the kty of the
+// signer is RSA.
+func WithSHA1RSA(priv interface{}) WithOption {
+	return func(p Profile) error {
+		pub, err := keys.PublicKey(priv)
+		if err != nil {
+			return err
+		}
+		switch pub.(type) {
+		case *rsa.PublicKey:
+			crt := p.Subject()
+			crt.SignatureAlgorithm = x509.SHA1WithRSA
+		}
+		return nil
+	}
+}
+
 // newProfile initializes the given profile.
 //
 // If the public/private key pair of the subject identity are not set by
@@ -232,7 +250,7 @@ func newProfile(p Profile, sub, iss *x509.Certificate, issPriv crypto.PrivateKey
 	p.SetIssuer(iss)
 	p.SetIssuerPrivateKey(issPriv)
 
-	for _, op := range withOps {
+	for _, op := range append(withOps, WithSHA1RSA(issPriv)) {
 		if err := op(p); err != nil {
 			return nil, err
 		}
@@ -323,6 +341,7 @@ func (b *base) GenerateDefaultKeyPair() error {
 	}
 	b.SetSubjectPublicKey(pub)
 	b.SetSubjectPrivateKey(priv)
+
 	return nil
 }
 
