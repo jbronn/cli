@@ -48,7 +48,7 @@ func defaultRootTemplate(cn string) *x509.Certificate {
 		BasicConstraintsValid: true,
 		MaxPathLen:            1,
 		MaxPathLenZero:        false,
-		Issuer:                pkix.Name{CommonName: cn},
-		Subject:               pkix.Name{CommonName: cn},
+		Issuer:                pkix.Name{CommonName: cn, Country: DefaultCountry, Locality: DefaultLocality, Organization: DefaultOrganization, Province: DefaultProvince},
+		Subject:               pkix.Name{CommonName: cn, Country: DefaultCountry, Locality: DefaultLocality, Organization: DefaultOrganization, Province: DefaultProvince},
 	}
 }
