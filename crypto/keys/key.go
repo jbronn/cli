@@ -17,7 +17,7 @@ var (
 	// DefaultKeyType is the default type of a private key.
 	DefaultKeyType = "RSA"
 	// DefaultKeySize is the default size (in # of bits) of a private key.
-	DefaultKeySize = 2048
+	DefaultKeySize = 4096
 	// DefaultKeyCurve is the default curve of a private key.
 	DefaultKeyCurve = "P-256"
 	// DefaultSignatureAlgorithm is the default signature algorithm used on a
