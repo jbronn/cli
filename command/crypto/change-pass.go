@@ -23,7 +23,8 @@ func changePassCommand() cli.Command {
 		Name:      "change-pass",
 		Action:    command.ActionFunc(changePassAction),
 		Usage:     "change password of an encrypted private key (PEM or JWK format)",
-		UsageText: `**step crypto change-pass** <key-file> [**--out**=<file>]`,
+		UsageText: `**step crypto change-pass** <key-file> [**--out**=<file>]
+[**--password-file**=<path>] [**--new-password-file**=<path>]`,
 		Description: `**step crypto change-pass** extracts the private key from
 a file and encrypts disk using a new password by either overwriting the original
 encrypted key or writing a new file to disk.
@@ -59,6 +60,14 @@ $ step crypto change-pass key.jwk --out new-key.jwk
 				Name:  "out,output-file",
 				Usage: "The <file> new encrypted key path. Default to overwriting the <key> positional argument",
 			},
+			cli.StringFlag{
+				Name:  "password-file",
+				Usage: `The path to the <file> containing the original password of the key`,
+			},
+			cli.StringFlag{
+				Name:  "new-password-file",
+				Usage: `The path to the <file> containing the new password to encrypt the key with.`,
+			},
 			flags.Force,
 		},
 	}
@@ -84,17 +93,30 @@ func changePassAction(ctx *cli.Context) error {
 		return errs.FileError(err, keyPath)
 	}
 
+	passwordFile := ctx.String("password-file")
+	newPasswordFile := ctx.String("new-password-file")
+
 	if bytes.HasPrefix(b, []byte("-----BEGIN ")) {
-		key, err := pemutil.Parse(b, pemutil.WithFilename(keyPath))
+		if len(passwordFile) == 0 {
+			key, err := pemutil.Parse(b, pemutil.WithFilename(keyPath))
+		} else {
+			key, err := pemutil.Parse(b, pemutil.WithPasswordFile(passwordFile), pemutil.WithFilename(keyPath))
+		}
 		if err != nil {
 			return err
 		}
-		pass, err := ui.PromptPassword(fmt.Sprintf("Please enter the password to encrypt %s", newKeyPath))
-		if err != nil {
-			return errors.Wrap(err, "error reading password")
-		}
-		if _, err := pemutil.Serialize(key, pemutil.WithPassword(pass), pemutil.ToFile(newKeyPath, 0644)); err != nil {
-			return err
+		if len(newPasswordFile) == 0 {
+			pass, err := ui.PromptPassword(fmt.Sprintf("Please enter the password to encrypt %s", newKeyPath))
+			if err != nil {
+				return errors.Wrap(err, "error reading password")
+			}
+			if _, err := pemutil.Serialize(key, pemutil.WithPassword(pass), pemutil.ToFile(newKeyPath, 0644)); err != nil {
+				return err
+			}
+		} else {
+			if _, err := pemutil.Serialize(key, pemutil.WithPasswordFile(newPasswordFile), pemutil.ToFile(newKeyPath, 0644)); err != nil {
+				return err
+			}
 		}
 	} else {
 		jwk, err := jose.ParseKey(keyPath)
