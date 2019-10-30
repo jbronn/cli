@@ -1,16 +1,21 @@
 package pki
 
 import (
+	"crypto"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"html"
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+
+	"golang.org/x/crypto/ssh"
 
 	"github.com/pkg/errors"
 	"github.com/smallstep/certificates/authority"
@@ -18,6 +23,7 @@ import (
 	"github.com/smallstep/certificates/ca"
 	"github.com/smallstep/certificates/db"
 	"github.com/smallstep/cli/config"
+	"github.com/smallstep/cli/crypto/keys"
 	"github.com/smallstep/cli/crypto/pemutil"
 	"github.com/smallstep/cli/crypto/tlsutil"
 	"github.com/smallstep/cli/crypto/x509util"
@@ -72,7 +78,7 @@ func GetRootCAPath() string {
 	return filepath.Join(config.StepPath(), publicPath, "root_ca.crt")
 }
 
-// GetOTTKeyPath returns the path where the ont-time token key is stored based
+// GetOTTKeyPath returns the path where the one-time token key is stored based
 // on the STEPPATH environment variable.
 func GetOTTKeyPath() string {
 	return filepath.Join(config.StepPath(), privatePath, "ott_key")
@@ -121,34 +127,34 @@ func GetProvisionerKey(caURL, rootFile, kid string) (string, error) {
 
 // PKI represents the Public Key Infrastructure used by a certificate authority.
 type PKI struct {
-	root, rootKey, rootFingerprint  string
-	intermediate, intermediateKey   string
-	country, locality, organization string
-	config, defaults                string
-	ottPublicKey                    *jose.JSONWebKey
-	ottPrivateKey                   *jose.JSONWebEncryption
-	provisioner                     string
-	address                         string
-	dnsNames                        []string
-	caURL                           string
+	root, rootKey, rootFingerprint string
+	intermediate, intermediateKey  string
+	sshHostPubKey, sshHostKey      string
+	sshUserPubKey, sshUserKey      string
+	config, defaults               string
+	ottPublicKey                   *jose.JSONWebKey
+	ottPrivateKey                  *jose.JSONWebEncryption
+	provisioner                    string
+	address                        string
+	dnsNames                       []string
+	caURL                          string
+	enableSSH                      bool
 }
 
 // New creates a new PKI configuration.
 func New(public, private, config string) (*PKI, error) {
-	var err error
-
-	if _, err = os.Stat(public); os.IsNotExist(err) {
+	if _, err := os.Stat(public); os.IsNotExist(err) {
 		if err = os.MkdirAll(public, 0700); err != nil {
 			return nil, errs.FileError(err, public)
 		}
 	}
-	if _, err = os.Stat(private); os.IsNotExist(err) {
+	if _, err := os.Stat(private); os.IsNotExist(err) {
 		if err = os.MkdirAll(private, 0700); err != nil {
 			return nil, errs.FileError(err, private)
 		}
 	}
 	if len(config) > 0 {
-		if _, err = os.Stat(config); os.IsNotExist(err) {
+		if _, err := os.Stat(config); os.IsNotExist(err) {
 			if err = os.MkdirAll(config, 0700); err != nil {
 				return nil, errs.FileError(err, config)
 			}
@@ -161,6 +167,7 @@ func New(public, private, config string) (*PKI, error) {
 		return s, errors.Wrapf(err, "error getting absolute path for %s", name)
 	}
 
+	var err error
 	p := &PKI{
 		provisioner: "step-cli",
 		address:     "127.0.0.1:9000",
@@ -178,6 +185,18 @@ func New(public, private, config string) (*PKI, error) {
 	if p.intermediateKey, err = getPath(private, "intermediate_ca_key"); err != nil {
 		return nil, err
 	}
+	if p.sshHostPubKey, err = getPath(public, "ssh_host_key.pub"); err != nil {
+		return nil, err
+	}
+	if p.sshUserPubKey, err = getPath(public, "ssh_user_key.pub"); err != nil {
+		return nil, err
+	}
+	if p.sshHostKey, err = getPath(private, "ssh_host_key"); err != nil {
+		return nil, err
+	}
+	if p.sshUserKey, err = getPath(private, "ssh_user_key"); err != nil {
+		return nil, err
+	}
 	if len(config) > 0 {
 		if p.config, err = getPath(config, "ca.json"); err != nil {
 			return nil, err
@@ -188,6 +207,16 @@ func New(public, private, config string) (*PKI, error) {
 	}
 
 	return p, nil
+}
+
+// GetCAConfigPath returns the path of the CA configuration file.
+func (p *PKI) GetCAConfigPath() string {
+	return p.config
+}
+
+// GetRootFingerprint returns the root fingerprint.
+func (p *PKI) GetRootFingerprint() string {
+	return p.rootFingerprint
 }
 
 // SetProvisioner sets the provisioner name of the OTT keys.
@@ -272,16 +301,68 @@ func (p *PKI) GenerateIntermediateCertificate(name string, rootCrt *x509.Certifi
 	return err
 }
 
+// GenerateSSHSigningKeys generates and encrypts a private key used for signing
+// SSH user certificates and a private key used for signing host certificates.
+func (p *PKI) GenerateSSHSigningKeys(password []byte) error {
+	var pubNames = []string{p.sshHostPubKey, p.sshUserPubKey}
+	var privNames = []string{p.sshHostKey, p.sshUserKey}
+	for i := 0; i < 2; i++ {
+		pub, priv, err := keys.GenerateDefaultKeyPair()
+		if err != nil {
+			return err
+		}
+		if _, ok := priv.(crypto.Signer); !ok {
+			return errors.Errorf("key of type %T is not a crypto.Signer", priv)
+		}
+		sshKey, err := ssh.NewPublicKey(pub)
+		if err != nil {
+			return errors.Wrapf(err, "error converting public key")
+		}
+		_, err = pemutil.Serialize(priv, pemutil.WithFilename(privNames[i]), pemutil.WithPassword(password))
+		if err != nil {
+			return err
+		}
+		if err = utils.WriteFile(pubNames[i], ssh.MarshalAuthorizedKey(sshKey), 0600); err != nil {
+			return err
+		}
+	}
+	p.enableSSH = true
+	return nil
+}
+
+func (p *PKI) askFeedback() {
+	ui.Println()
+	ui.Printf("\033[1mFEEDBACK\033[0m %s %s\n",
+		html.UnescapeString("&#"+strconv.Itoa(128525)+";"),
+		html.UnescapeString("&#"+strconv.Itoa(127867)+";"))
+	ui.Println("      The \033[1mstep\033[0m utility is not instrumented for usage statistics. It does not")
+	ui.Println("      phone home. But your feedback is extremely valuable. Any information you")
+	ui.Println("      can provide regarding how you’re using `step` helps. Please send us a")
+	ui.Println("      sentence or two, good or bad: \033[1mfeedback@smallstep.com\033[0m or join")
+	ui.Println("      \033[1mhttps://gitter.im/smallstep/community\033[0m.")
+}
+
 // TellPKI outputs the locations of public and private keys generated
 // generated for a new PKI. Generally this will consist of a root certificate
 // and key and an intermediate certificate and key.
 func (p *PKI) TellPKI() {
+	p.tellPKI()
+	p.askFeedback()
+}
+
+func (p *PKI) tellPKI() {
 	ui.Println()
 	ui.PrintSelected("Root certificate", p.root)
 	ui.PrintSelected("Root private key", p.rootKey)
 	ui.PrintSelected("Root fingerprint", p.rootFingerprint)
 	ui.PrintSelected("Intermediate certificate", p.intermediate)
 	ui.PrintSelected("Intermediate private key", p.intermediateKey)
+	if p.enableSSH {
+		ui.PrintSelected("SSH user root certificate", p.sshUserPubKey)
+		ui.PrintSelected("SSH user root private key", p.sshUserKey)
+		ui.PrintSelected("SSH host root certificate", p.sshHostPubKey)
+		ui.PrintSelected("SSH host root private key", p.sshHostKey)
+	}
 }
 
 type caDefaults struct {
@@ -315,17 +396,21 @@ func WithoutDB() Option {
 	}
 }
 
-// Save stores the pki on a json file that will be used as the certificate
-// authority configuration.
-func (p *PKI) Save(opt ...Option) error {
-	p.TellPKI()
-
+// GenerateConfig returns the step certificates configuration.
+func (p *PKI) GenerateConfig(opt ...Option) (*authority.Config, error) {
 	key, err := p.ottPrivateKey.CompactSerialize()
 	if err != nil {
-		return errors.Wrap(err, "error serializing private key")
+		return nil, errors.Wrap(err, "error serializing private key")
 	}
 
-	config := authority.Config{
+	prov := &provisioner.JWK{
+		Name:         p.provisioner,
+		Type:         "jwk",
+		Key:          p.ottPublicKey,
+		EncryptedKey: key,
+	}
+
+	config := &authority.Config{
 		Root:             []string{p.root},
 		FederatedRoots:   []string{},
 		IntermediateCert: p.intermediate,
@@ -339,9 +424,7 @@ func (p *PKI) Save(opt ...Option) error {
 		},
 		AuthorityConfig: &authority.AuthConfig{
 			DisableIssuedAtCheck: false,
-			Provisioners: provisioner.List{
-				&provisioner.JWK{Name: p.provisioner, Type: "jwk", Key: p.ottPublicKey, EncryptedKey: key},
-			},
+			Provisioners:         provisioner.List{prov},
 		},
 		TLS: &tlsutil.TLSOptions{
 			MinVersion:    x509util.DefaultTLSMinVersion,
@@ -350,17 +433,40 @@ func (p *PKI) Save(opt ...Option) error {
 			CipherSuites:  x509util.DefaultTLSCipherSuites,
 		},
 	}
+	if p.enableSSH {
+		enableSSHCA := true
+		config.SSH = &authority.SSHConfig{
+			HostKey: p.sshHostKey,
+			UserKey: p.sshUserKey,
+		}
+		prov.Claims = &provisioner.Claims{
+			EnableSSHCA: &enableSSHCA,
+		}
+	}
 
 	// Apply configuration modifiers
 	for _, o := range opt {
-		if err = o(&config); err != nil {
-			return err
+		if err = o(config); err != nil {
+			return nil, err
 		}
+	}
+
+	return config, nil
+}
+
+// Save stores the pki on a json file that will be used as the certificate
+// authority configuration.
+func (p *PKI) Save(opt ...Option) error {
+	p.tellPKI()
+
+	config, err := p.GenerateConfig(opt...)
+	if err != nil {
+		return err
 	}
 
 	b, err := json.MarshalIndent(config, "", "   ")
 	if err != nil {
-		return errors.Wrapf(err, "error marshalling %s", p.config)
+		return errors.Wrapf(err, "error marshaling %s", p.config)
 	}
 	if err = utils.WriteFile(p.config, b, 0666); err != nil {
 		return errs.FileError(err, p.config)
@@ -369,7 +475,8 @@ func (p *PKI) Save(opt ...Option) error {
 	// Generate the CA URL.
 	if p.caURL == "" {
 		p.caURL = p.dnsNames[0]
-		_, port, err := net.SplitHostPort(p.address)
+		var port string
+		_, port, err = net.SplitHostPort(p.address)
 		if err != nil {
 			return errors.Wrapf(err, "error parsing %s", p.address)
 		}
@@ -388,7 +495,7 @@ func (p *PKI) Save(opt ...Option) error {
 	}
 	b, err = json.MarshalIndent(defaults, "", "   ")
 	if err != nil {
-		return errors.Wrapf(err, "error marshalling %s", p.defaults)
+		return errors.Wrapf(err, "error marshaling %s", p.defaults)
 	}
 	if err = utils.WriteFile(p.defaults, b, 0666); err != nil {
 		return errs.FileError(err, p.defaults)
@@ -401,6 +508,8 @@ func (p *PKI) Save(opt ...Option) error {
 	}
 	ui.Println()
 	ui.Println("Your PKI is ready to go. To generate certificates for individual services see 'step help ca'.")
+
+	p.askFeedback()
 
 	return nil
 }

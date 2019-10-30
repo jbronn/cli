@@ -1,12 +1,14 @@
-package ca
+package cautils
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/pkg/errors"
@@ -20,31 +22,35 @@ import (
 	"github.com/smallstep/cli/ui"
 	"github.com/smallstep/cli/utils"
 	"github.com/urfave/cli"
+	"golang.org/x/crypto/ssh"
 )
 
-type caClient interface {
+// CaClient is the interface implemented by client used to sign, renew, or
+// revoke certificates.
+type CaClient interface {
 	Sign(req *api.SignRequest) (*api.SignResponse, error)
+	SignSSH(req *api.SignSSHRequest) (*api.SignSSHResponse, error)
 	Renew(tr http.RoundTripper) (*api.SignResponse, error)
 	Revoke(req *api.RevokeRequest, tr http.RoundTripper) (*api.RevokeResponse, error)
 }
 
-// offlineCA is a wrapper on top of the certificates authority methods that is
+// OfflineCA is a wrapper on top of the certificates authority methods that is
 // used to sign certificates without an online CA.
-type offlineCA struct {
+type OfflineCA struct {
 	authority  *authority.Authority
 	config     authority.Config
 	configFile string
 }
 
-// newOfflineCA initializes an offlineCA.
-func newOfflineCA(configFile string) (*offlineCA, error) {
+// NewOfflineCA initializes an offlineCA.
+func NewOfflineCA(configFile string) (*OfflineCA, error) {
 	b, err := utils.ReadFile(configFile)
 	if err != nil {
 		return nil, err
 	}
 
 	var config authority.Config
-	if err := json.Unmarshal(b, &config); err != nil {
+	if err = json.Unmarshal(b, &config); err != nil {
 		return nil, errors.Wrapf(err, "error reading %s", configFile)
 	}
 
@@ -57,16 +63,16 @@ func newOfflineCA(configFile string) (*offlineCA, error) {
 		return nil, err
 	}
 
-	return &offlineCA{
+	return &OfflineCA{
 		authority:  auth,
 		config:     config,
 		configFile: configFile,
 	}, nil
 }
 
-// VerifyClientCertificate verifies and validates the client cert/key pair
+// VerifyClientCert verifies and validates the client cert/key pair
 // using the offline CA root and intermediate certificates.
-func (c *offlineCA) VerifyClientCert(certFile, keyFile string) error {
+func (c *OfflineCA) VerifyClientCert(certFile, keyFile string) error {
 	cert, err := pemutil.ReadCertificate(certFile, pemutil.WithFirstBlock())
 	if err != nil {
 		return err
@@ -85,7 +91,7 @@ func (c *offlineCA) VerifyClientCert(certFile, keyFile string) error {
 		return err
 	}
 	// Validate that the certificate and key match
-	if _, err := tls.X509KeyPair(pem.EncodeToMemory(certPem), pem.EncodeToMemory(keyPem)); err != nil {
+	if _, err = tls.X509KeyPair(pem.EncodeToMemory(certPem), pem.EncodeToMemory(keyPem)); err != nil {
 		return errors.Wrap(err, "error loading x509 key pair")
 	}
 
@@ -103,7 +109,7 @@ func (c *offlineCA) VerifyClientCert(certFile, keyFile string) error {
 		Intermediates: intermediatePool,
 	}
 
-	if _, err := cert.Verify(opts); err != nil {
+	if _, err = cert.Verify(opts); err != nil {
 		return errors.Wrapf(err, "failed to verify certificate")
 	}
 
@@ -111,9 +117,9 @@ func (c *offlineCA) VerifyClientCert(certFile, keyFile string) error {
 }
 
 // Audience returns the token audience.
-func (c *offlineCA) Audience(tokType int) string {
+func (c *OfflineCA) Audience(tokType int) string {
 	switch tokType {
-	case revokeType:
+	case RevokeType:
 		return fmt.Sprintf("https://%s/revoke", c.config.DNSNames[0])
 	default:
 		return fmt.Sprintf("https://%s/sign", c.config.DNSNames[0])
@@ -121,25 +127,26 @@ func (c *offlineCA) Audience(tokType int) string {
 }
 
 // CaURL returns the CA URL using the first DNS entry.
-func (c *offlineCA) CaURL() string {
+func (c *OfflineCA) CaURL() string {
 	return fmt.Sprintf("https://%s", c.config.DNSNames[0])
 }
 
 // Root returns the path of the file used as root certificate.
-func (c *offlineCA) Root() string {
+func (c *OfflineCA) Root() string {
 	return c.config.Root.First()
 }
 
 // Provisioners returns the list of configured provisioners.
-func (c *offlineCA) Provisioners() provisioner.List {
+func (c *OfflineCA) Provisioners() provisioner.List {
 	return c.config.AuthorityConfig.Provisioners
 }
 
 // Sign is a wrapper on top of certificates Authorize and Sign methods. It
 // returns an api.SignResponse with the requested certificate and the
 // intermediate.
-func (c *offlineCA) Sign(req *api.SignRequest) (*api.SignResponse, error) {
-	opts, err := c.authority.Authorize(req.OTT)
+func (c *OfflineCA) Sign(req *api.SignRequest) (*api.SignResponse, error) {
+	ctx := provisioner.NewContextWithMethod(context.Background(), provisioner.SignMethod)
+	opts, err := c.authority.Authorize(ctx, req.OTT)
 	if err != nil {
 		return nil, err
 	}
@@ -158,9 +165,38 @@ func (c *offlineCA) Sign(req *api.SignRequest) (*api.SignResponse, error) {
 	}, nil
 }
 
+// SignSSH is a wrapper on top of certificate Authorize and SignSSH methods. It
+// returns an api.SignSSHResponse with the signed certificate.
+func (c *OfflineCA) SignSSH(req *api.SignSSHRequest) (*api.SignSSHResponse, error) {
+	publicKey, err := ssh.ParsePublicKey(req.PublicKey)
+	if err != nil {
+		return nil, errors.Wrap(err, "error parsing publicKey")
+	}
+	ctx := provisioner.NewContextWithMethod(context.Background(), provisioner.SignSSHMethod)
+	opts, err := c.authority.Authorize(ctx, req.OTT)
+	if err != nil {
+		return nil, err
+	}
+	signOpts := provisioner.SSHOptions{
+		CertType:    req.CertType,
+		Principals:  req.Principals,
+		ValidAfter:  req.ValidAfter,
+		ValidBefore: req.ValidBefore,
+	}
+	cert, err := c.authority.SignSSH(publicKey, signOpts, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return &api.SignSSHResponse{
+		Certificate: api.SSHCertificate{
+			Certificate: cert,
+		},
+	}, nil
+}
+
 // Renew is a wrapper on top of certificates Renew method. It returns an
 // api.SignResponse with the requested certificate and the intermediate.
-func (c *offlineCA) Renew(rt http.RoundTripper) (*api.SignResponse, error) {
+func (c *OfflineCA) Renew(rt http.RoundTripper) (*api.SignResponse, error) {
 	// it should not panic as this is always internal code
 	tr := rt.(*http.Transport)
 	asn1Data := tr.TLSClientConfig.Certificates[0].Certificate[0]
@@ -182,7 +218,7 @@ func (c *offlineCA) Renew(rt http.RoundTripper) (*api.SignResponse, error) {
 
 // Revoke is a wrapper on top of certificates Revoke method. It returns an
 // api.RevokeResponse.
-func (c *offlineCA) Revoke(req *api.RevokeRequest, rt http.RoundTripper) (*api.RevokeResponse, error) {
+func (c *OfflineCA) Revoke(req *api.RevokeRequest, rt http.RoundTripper) (*api.RevokeResponse, error) {
 	var (
 		opts = authority.RevokeOptions{
 			Serial:      req.Serial,
@@ -215,7 +251,7 @@ func (c *offlineCA) Revoke(req *api.RevokeRequest, rt http.RoundTripper) (*api.R
 }
 
 // GenerateToken creates the token used by the authority to authorize requests.
-func (c *offlineCA) GenerateToken(ctx *cli.Context, typ int, subject string, sans []string, notBefore, notAfter time.Time) (string, error) {
+func (c *OfflineCA) GenerateToken(ctx *cli.Context, typ int, subject string, sans []string, notBefore, notAfter time.Time, certNotBefore, certNotAfter provisioner.TimeDuration) (string, error) {
 	// Use ca.json configuration for the root and audience
 	root := c.Root()
 	audience := c.Audience(typ)
@@ -228,15 +264,33 @@ func (c *offlineCA) GenerateToken(ctx *cli.Context, typ int, subject string, san
 		return "", err
 	}
 
-	// With OIDC just run step oauth
-	if p, ok := p.(*provisioner.OIDC); ok {
-		out, err := exec.Step("oauth", "--oidc", "--bare",
+	switch p := p.(type) {
+	case *provisioner.OIDC: // Run step oauth
+		args := []string{"oauth", "--oidc", "--bare",
 			"--provider", p.ConfigurationEndpoint,
-			"--client-id", p.ClientID, "--client-secret", p.ClientSecret)
+			"--client-id", p.ClientID, "--client-secret", p.ClientSecret}
+		if ctx.Bool("console") {
+			args = append(args, "--console")
+		}
+		if p.ListenAddress != "" {
+			args = append(args, "--listen", p.ListenAddress)
+		}
+		out, err := exec.Step(args...)
 		if err != nil {
 			return "", err
 		}
-		return string(out), nil
+		return strings.TrimSpace(string(out)), nil
+	case *provisioner.GCP: // Do the identity request to get the token
+		sharedContext.DisableCustomSANs = p.DisableCustomSANs
+		return p.GetIdentityToken(subject, c.CaURL())
+	case *provisioner.AWS: // Do the identity request to get the token
+		sharedContext.DisableCustomSANs = p.DisableCustomSANs
+		return p.GetIdentityToken(subject, c.CaURL())
+	case *provisioner.Azure: // Do the identity request to get the token
+		sharedContext.DisableCustomSANs = p.DisableCustomSANs
+		return p.GetIdentityToken(subject, c.CaURL())
+	case *provisioner.ACME: // ACME provisioners do not implement the token flow.
+		return "", &ErrACMEToken{p.GetID()}
 	}
 
 	// JWK provisioner
@@ -271,5 +325,18 @@ func (c *offlineCA) GenerateToken(ctx *cli.Context, typ int, subject string, san
 		return "", errors.Wrap(err, "error unmarshalling provisioning key")
 	}
 
-	return generateToken(typ, subject, sans, kid, issuer, audience, root, notBefore, notAfter, jwk)
+	// Generate token
+	tokenGen := NewTokenGenerator(kid, issuer, audience, root, notBefore, notAfter, jwk)
+	switch typ {
+	case SignType:
+		return tokenGen.SignToken(subject, sans)
+	case RevokeType:
+		return tokenGen.RevokeToken(subject)
+	case SSHUserSignType:
+		return tokenGen.SignSSHToken(subject, provisioner.SSHUserCert, sans, certNotBefore, certNotAfter)
+	case SSHHostSignType:
+		return tokenGen.SignSSHToken(subject, provisioner.SSHHostCert, sans, certNotBefore, certNotAfter)
+	default:
+		return tokenGen.Token(subject)
+	}
 }
