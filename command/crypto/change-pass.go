@@ -124,12 +124,12 @@ func changePassAction(ctx *cli.Context) error {
 		if len(passwordFile) != 0 {
 			readOpts = append(readOpts, pemutil.WithPasswordFile(passwordFile))
 		}
-		readOpts = append(readOpts, pemutil.WithFilename(keyPath)) 
+		readOpts = append(readOpts, pemutil.WithFilename(keyPath))
 		key, err := pemutil.Parse(b, readOpts...)
 		if err != nil {
 			return err
 		}
-		
+
 		var writeOpts []pemutil.Options
 		if !noPass {
 			if len(newPasswordFile) != 0 {
