@@ -2,6 +2,7 @@ package ca
 
 import (
 	"crypto/tls"
+	"crypto/x509"
 	"net/http"
 	"os"
 	"strconv"
@@ -10,14 +11,17 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/smallstep/certificates/api"
+	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/certificates/ca"
 	"github.com/smallstep/cli/command"
 	"github.com/smallstep/cli/crypto/pemutil"
 	"github.com/smallstep/cli/crypto/pki"
 	"github.com/smallstep/cli/crypto/x509util"
 	"github.com/smallstep/cli/errs"
+	"github.com/smallstep/cli/flags"
 	"github.com/smallstep/cli/jose"
 	"github.com/smallstep/cli/ui"
+	"github.com/smallstep/cli/utils/cautils"
 	"github.com/urfave/cli"
 	"golang.org/x/crypto/ocsp"
 )
@@ -112,6 +116,11 @@ the step CA):
 $ step ca revoke --offline --cert foo.crt --key foo.key
 '''`,
 		Flags: []cli.Flag{
+			flags.CaConfig,
+			flags.CaURL,
+			flags.Offline,
+			flags.Root,
+			flags.Token,
 			cli.StringFlag{
 				Name:  "reasonCode",
 				Value: "",
@@ -179,12 +188,6 @@ attribute certificate have been compromised (reasonCode=10).
 				Name:  "key",
 				Usage: `The <path> to the key corresponding to the cert that should be revoked.`,
 			},
-			tokenFlag,
-			notBeforeFlag,
-			caURLFlag,
-			rootFlag,
-			offlineFlag,
-			caConfigFlag,
 		},
 	}
 }
@@ -232,14 +235,15 @@ func revokeCertificateAction(ctx *cli.Context) error {
 		if len(serial) > 0 {
 			errs.IncompatibleFlagWithFlag(ctx, "cert", "serial")
 		}
-		cert, err := pemutil.ReadCertificateBundle(certFile)
+		var cert []*x509.Certificate
+		cert, err = pemutil.ReadCertificateBundle(certFile)
 		if err != nil {
 			return err
 		}
 		serial = cert[0].SerialNumber.String()
 	} else {
 		// Must be using serial number so verify that only 1 command line args was given.
-		if err := errs.NumberOfArguments(ctx, 1); err != nil {
+		if err = errs.NumberOfArguments(ctx, 1); err != nil {
 			return err
 		}
 		if len(token) == 0 {
@@ -265,13 +269,13 @@ type revokeTokenClaims struct {
 }
 
 type revokeFlow struct {
-	offlineCA *offlineCA
+	offlineCA *cautils.OfflineCA
 	offline   bool
 }
 
 func newRevokeFlow(ctx *cli.Context, certFile, keyFile string) (*revokeFlow, error) {
 	var err error
-	var offlineClient *offlineCA
+	var offlineClient *cautils.OfflineCA
 
 	offline := ctx.Bool("offline")
 	if offline {
@@ -279,7 +283,7 @@ func newRevokeFlow(ctx *cli.Context, certFile, keyFile string) (*revokeFlow, err
 		if caConfig == "" {
 			return nil, errs.InvalidFlagValue(ctx, "ca-config", "", "")
 		}
-		offlineClient, err = newOfflineCA(caConfig)
+		offlineClient, err = cautils.NewOfflineCA(caConfig)
 		if err != nil {
 			return nil, err
 		}
@@ -296,7 +300,7 @@ func newRevokeFlow(ctx *cli.Context, certFile, keyFile string) (*revokeFlow, err
 	}, nil
 }
 
-func (f *revokeFlow) getClient(ctx *cli.Context, serial, token string) (caClient, error) {
+func (f *revokeFlow) getClient(ctx *cli.Context, serial, token string) (cautils.CaClient, error) {
 	if f.offline {
 		return f.offlineCA, nil
 	}
@@ -348,7 +352,7 @@ func (f *revokeFlow) getClient(ctx *cli.Context, serial, token string) (caClient
 func (f *revokeFlow) GenerateToken(ctx *cli.Context, subject *string) (string, error) {
 	// For offline just generate the token
 	if f.offline {
-		return f.offlineCA.GenerateToken(ctx, revokeType, *subject, nil, time.Time{}, time.Time{})
+		return f.offlineCA.GenerateToken(ctx, cautils.RevokeType, *subject, nil, time.Time{}, time.Time{}, provisioner.TimeDuration{}, provisioner.TimeDuration{})
 	}
 
 	// Use online CA to get the provisioners and generate the token
@@ -373,7 +377,7 @@ func (f *revokeFlow) GenerateToken(ctx *cli.Context, subject *string) (string, e
 		}
 	}
 
-	return newTokenFlow(ctx, revokeType, *subject, nil, caURL, root, time.Time{}, time.Time{})
+	return cautils.NewTokenFlow(ctx, cautils.RevokeType, *subject, nil, caURL, root, time.Time{}, time.Time{}, provisioner.TimeDuration{}, provisioner.TimeDuration{})
 }
 
 func (f *revokeFlow) Revoke(ctx *cli.Context, serial, token string) error {
@@ -396,7 +400,8 @@ func (f *revokeFlow) Revoke(ctx *cli.Context, serial, token string) error {
 		certFile, keyFile := ctx.String("cert"), ctx.String("key")
 
 		// If there is no token then we must be doing a Revoke over mTLS.
-		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+		var cert tls.Certificate
+		cert, err = tls.LoadX509KeyPair(certFile, keyFile)
 		if err != nil {
 			return errors.Wrap(err, "error loading certificates")
 		}
@@ -406,11 +411,12 @@ func (f *revokeFlow) Revoke(ctx *cli.Context, serial, token string) error {
 		root := ctx.String("root")
 		if len(root) == 0 {
 			root = pki.GetRootCAPath()
-			if _, err := os.Stat(root); err != nil {
+			if _, err = os.Stat(root); err != nil {
 				return errs.RequiredUnlessFlag(ctx, "root", "token")
 			}
 		}
-		rootCAs, err := x509util.ReadCertPool(root)
+		var rootCAs *x509.CertPool
+		rootCAs, err = x509util.ReadCertPool(root)
 		if err != nil {
 			return err
 		}

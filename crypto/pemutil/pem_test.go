@@ -54,6 +54,13 @@ hkjOPQIBBggqhkjOPQMBBwNCAASKj0MvK6CUzFqRLfDTQNQp0Zt5dcHYx+Dq1Wh9
 AwIDRwAwRAIgZgz9gdx9inOp6bSX4EkYiUCyLV9xGvabovu5C9UkRr8CIBGBbkp0
 l4tesAKoXelsLygJjPuUGRLK+OtdjPBIN1Zo
 -----END CERTIFICATE REQUEST-----`
+	testCSRKeytool = `-----BEGIN NEW CERTIFICATE REQUEST-----
+MIHYMIGAAgEAMB4xHDAaBgNVBAMTE2hlbGxvLnNtYWxsc3RlcC5jb20wWTATBgcq
+hkjOPQIBBggqhkjOPQMBBwNCAASKj0MvK6CUzFqRLfDTQNQp0Zt5dcHYx+Dq1Wh9
+5dhqf1Fu9+1m5+LKkgBWoZmo7sJH0RuSjIdv/sZwpBrkdn2soAAwCgYIKoZIzj0E
+AwIDRwAwRAIgZgz9gdx9inOp6bSX4EkYiUCyLV9xGvabovu5C9UkRr8CIBGBbkp0
+l4tesAKoXelsLygJjPuUGRLK+OtdjPBIN1Zo
+-----END NEW CERTIFICATE REQUEST-----`
 )
 
 type testdata struct {
@@ -450,7 +457,8 @@ func TestSerialize(t *testing.T) {
 						assert.Equals(t, p.Type, "RSA PRIVATE KEY")
 						assert.Equals(t, p.Headers["Proc-Type"], "4,ENCRYPTED")
 
-						der, err := x509.DecryptPEMBlock(p, []byte(test.pass))
+						var der []byte
+						der, err = x509.DecryptPEMBlock(p, []byte(test.pass))
 						assert.FatalError(t, err)
 						assert.Equals(t, der, x509.MarshalPKCS1PrivateKey(k))
 					}
@@ -458,7 +466,8 @@ func TestSerialize(t *testing.T) {
 					assert.False(t, x509.IsEncryptedPEMBlock(p))
 					assert.Equals(t, p.Type, "PUBLIC KEY")
 
-					b, err := x509.MarshalPKIXPublicKey(k)
+					var b []byte
+					b, err = x509.MarshalPKIXPublicKey(k)
 					assert.FatalError(t, err)
 					assert.Equals(t, p.Bytes, b)
 				case *ecdsa.PrivateKey:
@@ -474,17 +483,20 @@ func TestSerialize(t *testing.T) {
 						actualBytes, err = x509.DecryptPEMBlock(p, []byte(test.pass))
 						assert.FatalError(t, err)
 					}
-					expectedBytes, err := x509.MarshalECPrivateKey(k)
+					var expectedBytes []byte
+					expectedBytes, err = x509.MarshalECPrivateKey(k)
 					assert.FatalError(t, err)
 					assert.Equals(t, actualBytes, expectedBytes)
 
 					if test.file != "" {
 						// Check key permissions
-						fileInfo, err := os.Stat(test.file)
+						var fileInfo os.FileInfo
+						fileInfo, err = os.Stat(test.file)
 						assert.FatalError(t, err)
 						assert.Equals(t, fileInfo.Mode(), os.FileMode(0600))
 						// Verify that key written to file is correct
-						keyFileBytes, err := ioutil.ReadFile(test.file)
+						var keyFileBytes []byte
+						keyFileBytes, err = ioutil.ReadFile(test.file)
 						assert.FatalError(t, err)
 						pemKey, _ := pem.Decode(keyFileBytes)
 						assert.Equals(t, pemKey.Type, "EC PRIVATE KEY")
@@ -658,6 +670,13 @@ func TestParseKey_x509(t *testing.T) {
 	csr, err := x509.ParseCertificateRequest(b.Bytes)
 	assert.FatalError(t, err)
 	key, err = ParseKey([]byte(testCSR))
+	assert.FatalError(t, err)
+	assert.Equals(t, csr.PublicKey, key)
+
+	b, _ = pem.Decode([]byte(testCSRKeytool))
+	csr, err = x509.ParseCertificateRequest(b.Bytes)
+	assert.FatalError(t, err)
+	key, err = ParseKey([]byte(testCSRKeytool))
 	assert.FatalError(t, err)
 	assert.Equals(t, csr.PublicKey, key)
 }

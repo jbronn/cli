@@ -19,12 +19,14 @@ import (
 	"github.com/smallstep/cli/usage"
 
 	// Enabled commands
+	_ "github.com/smallstep/cli/command/base64"
 	_ "github.com/smallstep/cli/command/ca"
 	_ "github.com/smallstep/cli/command/certificate"
 	_ "github.com/smallstep/cli/command/crypto"
 	_ "github.com/smallstep/cli/command/fileserver"
 	_ "github.com/smallstep/cli/command/oauth"
 	_ "github.com/smallstep/cli/command/path"
+	_ "github.com/smallstep/cli/command/ssh"
 
 	// Profiling and debugging
 	_ "net/http/pprof"
@@ -127,7 +129,11 @@ func stringifyFlag(f cli.Flag) string {
 	usage := fv.FieldByName("Usage").String()
 	placeholder := placeholderString.FindString(usage)
 	if placeholder == "" {
-		placeholder = "<value>"
+		switch f.(type) {
+		case cli.BoolFlag, cli.BoolTFlag:
+		default:
+			placeholder = "<value>"
+		}
 	}
 	return cli.FlagNamePrefixer(fv.FieldByName("Name").String(), placeholder) + "\t" + usage
 }
