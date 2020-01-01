@@ -27,7 +27,7 @@ func NewLeafProfileWithTemplate(sub *x509.Certificate, iss *x509.Certificate, is
 // A new public/private key pair will be generated for the Profile if
 // not set in the `withOps` profile modifiers.
 func NewLeafProfile(cn string, iss *x509.Certificate, issPriv crypto.PrivateKey, withOps ...WithOption) (Profile, error) {
-	sub := defaultLeafTemplate(pkix.Name{CommonName: cn, Country: DefaultCountry, Locality: DefaultLocality, Organization: DefaultOrganization, Province: DefaultProvince}, iss.Subject)
+	sub := defaultLeafTemplate(pkix.Name{CommonName: cn, Country: DefaultCountry, Organization: DefaultOrganization}, iss.Subject)
 	return newProfile(&Leaf{}, sub, iss, issPriv, withOps...)
 }
 

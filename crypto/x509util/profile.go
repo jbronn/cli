@@ -22,8 +22,6 @@ import (
 var (
 	// Default location settings.
 	DefaultCountry          = []string{"US"}
-	DefaultProvince         = []string{"Texas"}
-	DefaultLocality         = []string{"Houston"}
 	DefaultOrganization     = []string{"Hillary, Justin, Sammy, and Jeeves (HJSJ)"}
 	// DefaultCertValidity is the minimum validity of an end-entity (not root or intermediate) certificate.
 	DefaultCertValidity = 24 * time.Hour
