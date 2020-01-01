@@ -36,7 +36,7 @@ func defaultIntermediateTemplate(name string) *x509.Certificate {
 		BasicConstraintsValid: true,
 		MaxPathLen:            0,
 		MaxPathLenZero:        true,
-		Issuer:                pkix.Name{CommonName: name, Country: DefaultCountry, Locality: DefaultLocality, Organization: DefaultOrganization, Province: DefaultProvince},
-		Subject:               pkix.Name{CommonName: name, Country: DefaultCountry, Locality: DefaultLocality, Organization: DefaultOrganization, Province: DefaultProvince},
+		Issuer:                pkix.Name{CommonName: name, Country: DefaultCountry, Organization: DefaultOrganization},
+		Subject:               pkix.Name{CommonName: name, Country: DefaultCountry, Organization: DefaultOrganization},
 	}
 }
