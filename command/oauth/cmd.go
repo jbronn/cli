@@ -24,6 +24,7 @@ import (
 	"github.com/smallstep/cli/crypto/randutil"
 	"github.com/smallstep/cli/errs"
 	"github.com/smallstep/cli/exec"
+	"github.com/smallstep/cli/flags"
 	"github.com/smallstep/cli/jose"
 	"github.com/urfave/cli"
 )
@@ -74,8 +75,56 @@ func init() {
 **step oauth** [**--account**=<account>] [**--authorization-endpoint**=<authorization-endpoint> **--token-endpoint**=<token-endpoint>]
   [**--scope**=<scope> ...] [**--bare** [**--oidc**]] [**--header** [**--oidc**]]
 
-**step oauth** **--account**=<account> **--jwt** [**--scope**=<scope> ...] [**--header**] [**-bare**]
-`,
+**step oauth** **--account**=<account> **--jwt** [**--scope**=<scope> ...] [**--header**] [**-bare**]`,
+		Description: `**step oauth** command implements the OAuth 2.0 authorization flow.
+
+OAuth is an open standard for access delegation, commonly used as a way for
+Internet users to grant websites or applications access to their information on
+other websites but without giving them the passwords. This mechanism is used by
+companies such as Amazon, Google, Facebook, Microsoft and Twitter to permit the
+users to share information about their accounts with third party applications or
+websites. Learn more at https://en.wikipedia.org/wiki/OAuth.
+
+This command by default performs he authorization flow with a preconfigured
+Google application, but a custom one can be set combining the flags
+**--client-id**, **--client-secret**, and **--provider**. The provider value
+must be set to the OIDC discovery document (.well-known/openid-configuration)
+endpoint. If Google is used this flag is not necessary, but the appropriate
+value would be be https://accounts.google.com or
+https://accounts.google.com/.well-known/openid-configuration
+
+## EXAMPLES
+
+Do the OAuth 2.0 flow using the default client:
+'''
+$ step oauth
+'''
+
+Redirect to localhost instead of 127.0.0.1:
+'''
+$ step oauth --listen localhost:0
+'''
+
+Redirect to a fixed port instead of random one:
+'''
+$ step oauth --listen :10000
+'''
+
+Get just the access token:
+'''
+$ step oauth --bare
+'''
+
+Get just the OIDC token:
+'''
+$ step oauth --oidc --bare
+'''
+
+Use a custom OAuth2.0 server:
+''''
+$ step oauth --client-id my-client-id --client-secret my-client-secret \
+  --provider https://example.org
+'''`,
 		Flags: []cli.Flag{
 			cli.StringFlag{
 				Name:  "provider, idp",
@@ -144,6 +193,7 @@ func init() {
 				Usage:  "Allows the use of insecure flows.",
 				Hidden: true,
 			},
+			flags.RedirectURL,
 		},
 		Action: oauthCmd,
 	}
@@ -158,6 +208,7 @@ func oauthCmd(c *cli.Context) error {
 		Console:          c.Bool("console"),
 		Implicit:         c.Bool("implicit"),
 		CallbackListener: c.String("listen"),
+		TerminalRedirect: c.String("redirect-url"),
 	}
 	if err := opts.Validate(); err != nil {
 		return err
@@ -285,6 +336,7 @@ type options struct {
 	Console          bool
 	Implicit         bool
 	CallbackListener string
+	TerminalRedirect string
 }
 
 // Validate validates the options.
@@ -315,6 +367,7 @@ type oauth struct {
 	nonce            string
 	implicit         bool
 	CallbackListener string
+	terminalRedirect string
 	errCh            chan error
 	tokCh            chan *token
 }
@@ -351,6 +404,7 @@ func newOauth(provider, clientID, clientSecret, authzEp, tokenEp, scope string, 
 			nonce:            nonce,
 			implicit:         opts.Implicit,
 			CallbackListener: opts.CallbackListener,
+			terminalRedirect: opts.TerminalRedirect,
 			errCh:            make(chan error),
 			tokCh:            make(chan *token),
 		}, nil
@@ -386,6 +440,7 @@ func newOauth(provider, clientID, clientSecret, authzEp, tokenEp, scope string, 
 			nonce:            nonce,
 			implicit:         opts.Implicit,
 			CallbackListener: opts.CallbackListener,
+			terminalRedirect: opts.TerminalRedirect,
 			errCh:            make(chan error),
 			tokCh:            make(chan *token),
 		}, nil
@@ -440,6 +495,16 @@ func (o *oauth) NewServer() (*httptest.Server, error) {
 		Config:   &http.Server{Handler: o},
 	}
 	srv.Start()
+
+	// Update host to use for example localhost
+	if host != "127.0.0.1" {
+		_, p, err := net.SplitHostPort(l.Addr().String())
+		if err != nil {
+			return nil, errors.Wrapf(err, "error parsing %s", l.Addr().String())
+		}
+		srv.URL = "http://" + host + ":" + p
+	}
+
 	return srv, nil
 }
 
@@ -675,12 +740,11 @@ func (o *oauth) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	w.WriteHeader(http.StatusOK)
-	w.Header().Add("Content-Type", "text/plain; charset=utf-8")
-	w.Write([]byte(`<html><head><title>OAuth Request Successful</title>`))
-	w.Write([]byte(`</head><body><p style='font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol"; font-size: 22px; color: #333; width: 400px; margin: 0 auto; text-align: center; line-height: 1.7; padding: 20px;'>`))
-	w.Write([]byte(`<strong style='font-size: 28px; color: #000;'>Success</strong><br />Look for the token on the command line`))
-	w.Write([]byte(`</p></body></html>`))
+	if o.terminalRedirect != "" {
+		http.Redirect(w, req, o.terminalRedirect, 302)
+	} else {
+		o.success(w)
+	}
 	o.tokCh <- tok
 }
 
@@ -698,12 +762,11 @@ func (o *oauth) implicitHandler(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 
-		w.WriteHeader(http.StatusOK)
-		w.Header().Add("Content-Type", "text/plain; charset=utf-8")
-		w.Write([]byte(`<html><head><title>OAuth Request Successful</title>`))
-		w.Write([]byte(`</head><body><p style='font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol"; font-size: 22px; color: #333; width: 400px; margin: 0 auto; text-align: center; line-height: 1.7; padding: 20px;'>`))
-		w.Write([]byte(`<strong style='font-size: 28px; color: #000;'>Success</strong><br />Look for the token on the command line`))
-		w.Write([]byte(`</p></body></html>`))
+		if o.terminalRedirect != "" {
+			http.Redirect(w, req, o.terminalRedirect, 302)
+		} else {
+			o.success(w)
+		}
 
 		expiresIn, _ := strconv.Atoi(q.Get("expires_in"))
 		o.tokCh <- &token{
@@ -780,6 +843,15 @@ func (o *oauth) Exchange(tokenEndpoint, code string) (*token, error) {
 	}
 
 	return &tok, nil
+}
+
+func (o *oauth) success(w http.ResponseWriter) {
+	w.WriteHeader(http.StatusOK)
+	w.Header().Add("Content-Type", "text/plain; charset=utf-8")
+	w.Write([]byte(`<html><head><title>OAuth Request Successful</title>`))
+	w.Write([]byte(`</head><body><p style='font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol"; font-size: 22px; color: #333; width: 400px; margin: 0 auto; text-align: center; line-height: 1.7; padding: 20px;'>`))
+	w.Write([]byte(`<strong style='font-size: 28px; color: #000;'>Success</strong><br />Look for the token on the command line`))
+	w.Write([]byte(`</p></body></html>`))
 }
 
 func (o *oauth) badRequest(w http.ResponseWriter, msg string) {

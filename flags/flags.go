@@ -69,10 +69,24 @@ unset, default is P-256 for EC keys and Ed25519 for OKP keys.
 		Name: "insecure",
 	}
 
+	// K8sSATokenPathFlag is an optional flag that allows modification of the
+	// kubernetes service account token path.
+	K8sSATokenPathFlag = cli.StringFlag{
+		Name:  "k8ssa-token-path",
+		Usage: `Configure the <file> from which to read the kubernetes service account token.`,
+		Value: `/var/run/secrets/kubernetes.io/serviceaccount/token`,
+	}
+
 	// Force is a cli.Flag used to overwrite files.
 	Force = cli.BoolFlag{
 		Name:  "f,force",
 		Usage: "Force the overwrite of files without asking.",
+	}
+
+	// DryRun is a cli.Flag used to avoid the writing of files.
+	DryRun = cli.BoolFlag{
+		Name:  "dry-run",
+		Usage: "Executes the command without changing any file.",
 	}
 
 	// PasswordFile is a cli.Flag used to pass a file to encrypt or decrypt a
@@ -125,6 +139,22 @@ as "300ms", "-1.5h" or "2h45m". Valid time units are "ns", "us" (or "µs"), "ms"
 		Usage: "The provisioner <name> to use.",
 	}
 
+	// ProvisionerPasswordFile is a cli.Flag used to pass the password file to
+	// decrypt the generating key.
+	ProvisionerPasswordFile = cli.StringFlag{
+		Name: "provisioner-password-file",
+		Usage: `The path to the <file> containing the password to decrypt the one-time token
+generating key.`,
+	}
+
+	// ProvisionerPasswordFileWithAlias is a cli.Flag that allows multiple
+	// alias flag names for the ProvisionerPasswordFile.
+	ProvisionerPasswordFileWithAlias = cli.StringFlag{
+		Name: "provisioner-password-file,password-file",
+		Usage: `The path to the <file> containing the password to decrypt the one-time token
+generating key.`,
+	}
+
 	// CaURL is a cli.Flag used to pass the CA url.
 	CaURL = cli.StringFlag{
 		Name:  "ca-url",
@@ -151,6 +181,75 @@ but can accept a different configuration file using '--ca-config>' flag.`,
 		Usage: `The <path> to the certificate authority configuration file. Defaults to
 $STEPPATH/config/ca.json`,
 		Value: filepath.Join(config.StepPath(), "config", "ca.json"),
+	}
+
+	// X5cCert is a cli.Flag used to pass the x5c header certificate for a JWT.
+	X5cCert = cli.StringFlag{
+		Name:  "x5c-cert",
+		Usage: "Certificate (<chain>) in PEM format to store in the 'x5c' header of a JWT.",
+	}
+
+	// X5cKey is a cli.Flag used to pass the private key (corresponding to the x5c-cert)
+	// that is used to sign the token.
+	X5cKey = cli.StringFlag{
+		Name: "x5c-key",
+		Usage: `Private key <path>, used to sign a JWT, corresponding to the certificate that will
+be stored in the 'x5c' header.`,
+	}
+
+	// X5tCert is a cli.Flag used to pass the x5t header certificate thumbprint
+	// for a JWS or JWT.
+	X5tCert = cli.StringFlag{
+		Name:  "x5t-cert",
+		Usage: "Certificate <path> in PEM format to use for the 'x5t' header of a JWS or JWT",
+	}
+
+	// X5tKey is a cli.Flag used to pass the private key (corresponding to the x5t-cert)
+	// that is used to sign the token.
+	X5tKey = cli.StringFlag{
+		Name: "x5t-key",
+		Usage: `Private key <path>, used to sign a JWT, corresponding to the certificate used for
+the 'x5t' header.`,
+	}
+
+	// SSHPOPCert is a cli.Flag used to pass the sshpop header certificate for a JWT.
+	SSHPOPCert = cli.StringFlag{
+		Name:  "sshpop-cert",
+		Usage: "Certificate (<chain>) in PEM format to store in the 'sshpop' header of a JWT.",
+	}
+
+	// SSHPOPKey is a cli.Flag used to pass the private key (corresponding to the sshpop-cert)
+	// that is used to sign the token.
+	SSHPOPKey = cli.StringFlag{
+		Name: "sshpop-key",
+		Usage: `Private key <path>, used to sign a JWT, corresponding to the certificate that will
+be stored in the 'sshpop' header.`,
+	}
+
+	// Team is a cli.Flag used to pass the team name.
+	Team = cli.StringFlag{
+		Name:  "team",
+		Usage: "The team <name> used to bootstrap the environment.",
+	}
+
+	// TeamURL is a cli.Flag used to pass the team URL.
+	TeamURL = cli.StringFlag{
+		Name: "team-url",
+		Usage: `The <url> step queries to retrieve initial team configuration. Only used with
+the --team option. If the url contains "\<\>" placeholders, they are replaced with the team name.`,
+	}
+
+	// RedirectURL is a cli.Flag used to pass the OAuth redirect URL.
+	RedirectURL = cli.StringFlag{
+		Name:  "redirect-url",
+		Usage: "Terminal OAuth redirect <url>.",
+	}
+
+	// ServerName is a cli.Flag used to set the TLS Server Name Indication in
+	// request to a server.
+	ServerName = cli.StringFlag{
+		Name:  "servername",
+		Usage: `TLS Server Name Indication that should be sent to request a specific certificate from the server.`,
 	}
 )
 

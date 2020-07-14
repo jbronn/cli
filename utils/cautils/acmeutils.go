@@ -18,8 +18,8 @@ import (
 	"github.com/smallstep/certificates/acme"
 	acmeAPI "github.com/smallstep/certificates/acme/api"
 	"github.com/smallstep/certificates/ca"
+	"github.com/smallstep/certificates/pki"
 	"github.com/smallstep/cli/crypto/keys"
-	"github.com/smallstep/cli/crypto/pki"
 	"github.com/smallstep/cli/errs"
 	"github.com/smallstep/cli/jose"
 	"github.com/smallstep/cli/ui"
@@ -267,9 +267,9 @@ func finalizeOrder(ac *ca.ACMEClient, o *acme.Order, csr *x509.CertificateReques
 }
 
 func validateSANsForACME(sans []string) ([]string, error) {
-	dnsNames, ips, emails := splitSANs(sans)
-	if len(ips) > 0 || len(emails) > 0 {
-		return nil, errors.New("IP Address and Email Address SANs are not supported for ACME flow")
+	dnsNames, ips, emails, uris := splitSANs(sans)
+	if len(ips) > 0 || len(emails) > 0 || len(uris) > 0 {
+		return nil, errors.New("IP Address, Email Address, and URI SANs are not supported for ACME flow")
 	}
 	for _, dns := range dnsNames {
 		if strings.Contains(dns, "*") {
@@ -449,7 +449,12 @@ func (af *acmeFlow) GetCertificate() ([]*x509.Certificate, error) {
 	}
 
 	if af.csr == nil {
-		af.priv, err = keys.GenerateDefaultKey()
+		insecure := af.ctx.Bool("insecure")
+		kty, crv, size, err := utils.GetKeyDetailsFromCLI(af.ctx, insecure, "kty", "curve", "size")
+		if err != nil {
+			return nil, err
+		}
+		af.priv, err = keys.GenerateKey(kty, crv, size)
 		if err != nil {
 			return nil, errors.Wrap(err, "error generating private key")
 		}

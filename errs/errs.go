@@ -122,7 +122,7 @@ func FlagValueInsecure(ctx *cli.Context, flag string, value string) error {
 }
 
 // InvalidFlagValue returns an error with the given value being missing or
-// invalid for the given flag. Optionally it lists the given formated options
+// invalid for the given flag. Optionally it lists the given formatted options
 // at the end.
 func InvalidFlagValue(ctx *cli.Context, flag string, value string, options string) error {
 	var format string
@@ -167,9 +167,9 @@ func IncompatibleFlagValues(ctx *cli.Context, flag, value, incompatibleWith,
 		flag, value, incompatibleWith, incompatibleWithValue)
 }
 
-// IncompatibleFlagValueWithFlagValue returns an error with the given value being missing or
-// invalid for the given flag. Optionally it lists the given formated options
-// at the end.
+// IncompatibleFlagValueWithFlagValue returns an error with the given value
+// being missing or invalid for the given flag. Optionally it lists the given
+// formatted options at the end.
 func IncompatibleFlagValueWithFlagValue(ctx *cli.Context, flag string, value string,
 	withFlag string, withValue, options string) error {
 	format := fmt.Sprintf("flag '--%s %s' is incompatible with flag '--%s %s'",
@@ -196,6 +196,11 @@ func RequiredWithFlag(ctx *cli.Context, flag, required string) error {
 // RequiredWithFlagValue returns an error with the required flag message.
 func RequiredWithFlagValue(ctx *cli.Context, flag, value, required string) error {
 	return errors.Errorf("'--%s %s' requires the '--%s' flag", flag, value, required)
+}
+
+// RequiredWithProvisionerTypeFlag returns an error with the required flag message.
+func RequiredWithProvisionerTypeFlag(ctx *cli.Context, provisionerType, required string) error {
+	return errors.Errorf("provisioner type '%s' requires the '--%s' flag", provisionerType, required)
 }
 
 // RequiredInsecureFlag returns an error with the given flag requiring the
@@ -265,6 +270,12 @@ func MutuallyExclusiveFlags(ctx *cli.Context, flag1, flag2 string) error {
 	return errors.Errorf("flag '--%s' and flag '--%s' are mutually exclusive", flag1, flag2)
 }
 
+// UnsupportedFlag returns an error with a message saying that the given flag is
+// not yet supported.
+func UnsupportedFlag(ctx *cli.Context, flag string) error {
+	return errors.Errorf("flag '--%s' is not yet supported", flag)
+}
+
 // usage returns the command usage text if set or a default usage string.
 func usage(ctx *cli.Context) string {
 	if len(ctx.Command.UsageText) == 0 {
@@ -290,4 +301,9 @@ func FileError(err error, filename string) error {
 	default:
 		return Wrap(err, "unexpected error on %s", filename)
 	}
+}
+
+// FriendlyError is an interface for returning friendly error messages to the user.
+type FriendlyError interface {
+	Message() string
 }

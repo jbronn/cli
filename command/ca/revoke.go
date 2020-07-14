@@ -13,9 +13,9 @@ import (
 	"github.com/smallstep/certificates/api"
 	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/certificates/ca"
+	"github.com/smallstep/certificates/pki"
 	"github.com/smallstep/cli/command"
 	"github.com/smallstep/cli/crypto/pemutil"
-	"github.com/smallstep/cli/crypto/pki"
 	"github.com/smallstep/cli/crypto/x509util"
 	"github.com/smallstep/cli/errs"
 	"github.com/smallstep/cli/flags"
@@ -116,11 +116,14 @@ the step CA):
 $ step ca revoke --offline --cert foo.crt --key foo.key
 '''`,
 		Flags: []cli.Flag{
-			flags.CaConfig,
-			flags.CaURL,
-			flags.Offline,
-			flags.Root,
-			flags.Token,
+			cli.StringFlag{
+				Name:  "cert",
+				Usage: `The path to the <cert> that should be revoked.`,
+			},
+			cli.StringFlag{
+				Name:  "key",
+				Usage: `The <path> to the key corresponding to the cert that should be revoked.`,
+			},
 			cli.StringFlag{
 				Name:  "reasonCode",
 				Value: "",
@@ -180,14 +183,11 @@ attribute certificate have been compromised (reasonCode=10).
 				Name:  "reason",
 				Usage: `The <string> representing the reason for which the cert is being revoked.`,
 			},
-			cli.StringFlag{
-				Name:  "cert",
-				Usage: `The path to the <cert> that should be revoked.`,
-			},
-			cli.StringFlag{
-				Name:  "key",
-				Usage: `The <path> to the key corresponding to the cert that should be revoked.`,
-			},
+			flags.CaConfig,
+			flags.CaURL,
+			flags.Offline,
+			flags.Root,
+			flags.Token,
 		},
 	}
 }
@@ -319,7 +319,7 @@ func (f *revokeFlow) getClient(ctx *cli.Context, serial, token string) (cautils.
 		if err := tok.UnsafeClaimsWithoutVerification(&claims); err != nil {
 			return nil, errors.Wrap(err, "error parsing flag '--token'")
 		}
-		if strings.ToLower(claims.Subject) != strings.ToLower(serial) {
+		if !strings.EqualFold(claims.Subject, serial) {
 			return nil, errors.Errorf("token subject '%s' and serial number '%s' do not match", claims.Subject, serial)
 		}
 

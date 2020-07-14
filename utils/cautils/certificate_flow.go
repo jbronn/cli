@@ -8,6 +8,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -16,9 +17,9 @@ import (
 	"github.com/smallstep/certificates/api"
 	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/certificates/ca"
+	"github.com/smallstep/certificates/pki"
 	"github.com/smallstep/cli/crypto/keys"
 	"github.com/smallstep/cli/crypto/pemutil"
-	"github.com/smallstep/cli/crypto/pki"
 	"github.com/smallstep/cli/crypto/x509util"
 	"github.com/smallstep/cli/errs"
 	"github.com/smallstep/cli/token"
@@ -62,7 +63,7 @@ func NewCertificateFlow(ctx *cli.Context) (*CertificateFlow, error) {
 }
 
 // GetClient returns the client used to send requests to the CA.
-func (f *CertificateFlow) GetClient(ctx *cli.Context, subject, tok string) (CaClient, error) {
+func (f *CertificateFlow) GetClient(ctx *cli.Context, tok string, options ...ca.ClientOption) (CaClient, error) {
 	if f.offline {
 		return f.offlineCA, nil
 	}
@@ -76,7 +77,6 @@ func (f *CertificateFlow) GetClient(ctx *cli.Context, subject, tok string) (CaCl
 		return nil, errors.Wrap(err, "error parsing flag '--token'")
 	}
 	// Prepare client for bootstrap or provisioning tokens
-	var options []ca.ClientOption
 	if len(jwt.Payload.SHA) > 0 && len(jwt.Payload.Audience) > 0 && strings.HasPrefix(strings.ToLower(jwt.Payload.Audience[0]), "http") {
 		if len(caURL) == 0 {
 			caURL = jwt.Payload.Audience[0]
@@ -134,17 +134,7 @@ func (f *CertificateFlow) GenerateToken(ctx *cli.Context, subject string, sans [
 
 // GenerateSSHToken generates a token used to authorize the sign of an SSH
 // certificate.
-func (f *CertificateFlow) GenerateSSHToken(ctx *cli.Context, subject, certType string, principals []string, validAfter, validBefore provisioner.TimeDuration) (string, error) {
-	var typ int
-	switch certType {
-	case provisioner.SSHUserCert:
-		typ = SSHUserSignType
-	case provisioner.SSHHostCert:
-		typ = SSHHostSignType
-	default:
-		return "", errors.Errorf("unsupported cert type %s", certType)
-	}
-
+func (f *CertificateFlow) GenerateSSHToken(ctx *cli.Context, subject string, typ int, principals []string, validAfter, validBefore provisioner.TimeDuration) (string, error) {
 	if f.offline {
 		return f.offlineCA.GenerateToken(ctx, typ, subject, principals, time.Time{}, time.Time{}, validAfter, validBefore)
 	}
@@ -174,9 +164,25 @@ func (f *CertificateFlow) GenerateSSHToken(ctx *cli.Context, subject, certType s
 	return NewTokenFlow(ctx, typ, subject, principals, caURL, root, time.Time{}, time.Time{}, validAfter, validBefore)
 }
 
+// GenerateIdentityToken generates a token using only an OIDC provisioner.
+func (f *CertificateFlow) GenerateIdentityToken(ctx *cli.Context) (string, error) {
+	caURL := ctx.String("ca-url")
+	if len(caURL) == 0 {
+		return "", errs.RequiredFlag(ctx, "ca-url")
+	}
+	root := ctx.String("root")
+	if len(root) == 0 {
+		root = pki.GetRootCAPath()
+		if _, err := os.Stat(root); err != nil {
+			return "", errs.RequiredFlag(ctx, "root")
+		}
+	}
+	return NewIdentityTokenFlow(ctx, caURL, root)
+}
+
 // Sign signs the CSR using the online or the offline certificate authority.
 func (f *CertificateFlow) Sign(ctx *cli.Context, token string, csr api.CertificateRequest, crtFile string) error {
-	client, err := f.GetClient(ctx, csr.Subject.CommonName, token)
+	client, err := f.GetClient(ctx, token)
 	if err != nil {
 		return err
 	}
@@ -199,15 +205,17 @@ func (f *CertificateFlow) Sign(ctx *cli.Context, token string, csr api.Certifica
 		return err
 	}
 
-	serverBlock, err := pemutil.Serialize(resp.ServerPEM.Certificate)
-	if err != nil {
-		return err
+	if resp.CertChainPEM == nil || len(resp.CertChainPEM) == 0 {
+		resp.CertChainPEM = []api.Certificate{resp.ServerPEM, resp.CaPEM}
 	}
-	caBlock, err := pemutil.Serialize(resp.CaPEM.Certificate)
-	if err != nil {
-		return err
+	var data []byte
+	for _, certPEM := range resp.CertChainPEM {
+		pemblk, err := pemutil.Serialize(certPEM.Certificate)
+		if err != nil {
+			return errors.Wrap(err, "error serializing from step-ca API response")
+		}
+		data = append(data, pem.EncodeToMemory(pemblk)...)
 	}
-	data := append(pem.EncodeToMemory(serverBlock), pem.EncodeToMemory(caBlock)...)
 	return utils.WriteFile(crtFile, data, 0600)
 }
 
@@ -228,7 +236,7 @@ func (f *CertificateFlow) CreateSignRequest(ctx *cli.Context, tok, subject strin
 		return nil, nil, err
 	}
 
-	dnsNames, ips, emails := splitSANs(sans, jwt.Payload.SANs)
+	dnsNames, ips, emails, uris := splitSANs(sans, jwt.Payload.SANs)
 	switch jwt.Payload.Type() {
 	case token.AWS:
 		doc := jwt.Payload.Amazon.InstanceIdentityDocument
@@ -240,7 +248,7 @@ func (f *CertificateFlow) CreateSignRequest(ctx *cli.Context, tok, subject strin
 			if !sharedContext.DisableCustomSANs {
 				defaultSANs = append(defaultSANs, subject)
 			}
-			dnsNames, ips, emails = splitSANs(defaultSANs)
+			dnsNames, ips, emails, uris = splitSANs(defaultSANs)
 		}
 	case token.GCP:
 		ce := jwt.Payload.Google.ComputeEngine
@@ -252,7 +260,7 @@ func (f *CertificateFlow) CreateSignRequest(ctx *cli.Context, tok, subject strin
 			if !sharedContext.DisableCustomSANs {
 				defaultSANs = append(defaultSANs, subject)
 			}
-			dnsNames, ips, emails = splitSANs(defaultSANs)
+			dnsNames, ips, emails, uris = splitSANs(defaultSANs)
 		}
 	case token.Azure:
 		if len(ips) == 0 && len(dnsNames) == 0 {
@@ -262,7 +270,7 @@ func (f *CertificateFlow) CreateSignRequest(ctx *cli.Context, tok, subject strin
 			if !sharedContext.DisableCustomSANs {
 				defaultSANs = append(defaultSANs, subject)
 			}
-			dnsNames, ips, emails = splitSANs(defaultSANs)
+			dnsNames, ips, emails, uris = splitSANs(defaultSANs)
 		}
 	case token.OIDC:
 		if jwt.Payload.Email != "" {
@@ -280,6 +288,7 @@ func (f *CertificateFlow) CreateSignRequest(ctx *cli.Context, tok, subject strin
 		DNSNames:       dnsNames,
 		IPAddresses:    ips,
 		EmailAddresses: emails,
+		URIs:           uris,
 	}
 
 	csr, err := x509.CreateCertificateRequest(rand.Reader, template, pk)
@@ -301,7 +310,7 @@ func (f *CertificateFlow) CreateSignRequest(ctx *cli.Context, tok, subject strin
 
 // splitSANs unifies the SAN collections passed as arguments and returns a list
 // of DNS names, a list of IP addresses, and a list of emails.
-func splitSANs(args ...[]string) (dnsNames []string, ipAddresses []net.IP, email []string) {
+func splitSANs(args ...[]string) (dnsNames []string, ipAddresses []net.IP, email []string, uris []*url.URL) {
 	m := make(map[string]bool)
 	var unique []string
 	for _, sans := range args {

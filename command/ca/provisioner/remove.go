@@ -7,6 +7,7 @@ import (
 	"github.com/smallstep/certificates/authority"
 	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/cli/errs"
+	"github.com/smallstep/cli/ui"
 	"github.com/urfave/cli"
 )
 
@@ -40,10 +41,10 @@ used in combination w/ the **--kid** or **--client-id** flag.`,
 				Usage: `The <type> of provisioner to remove. Type is a case-insensitive string
 and must be one of:
     **JWK**
-    : Uses an JWK key pair to sign bootstrap tokens.
+    : Uses an JWK key pair to sign provisioning tokens.
 
     **OIDC**
-    : Uses an OpenID Connect provider to sign bootstrap tokens.
+    : Uses an OpenID Connect provider to sign provisioning tokens.
 
     **AWS**
     : Uses Amazon AWS instance identity documents.
@@ -55,11 +56,20 @@ and must be one of:
     : Uses Microsoft Azure identity tokens.
 
     **ACME**
-    : Uses ACME protocol.`,
+    : Uses ACME protocol.
+
+    **X5C**
+    : Uses an X509 Certificate / private key pair to sign provisioning tokens.
+
+    **K8sSA**
+    : Uses Kubernetes Service Account tokens.`,
 			},
 		},
 		Description: `**step ca provisioner remove** removes one or more provisioners
 from the configuration and writes the new configuration back to the CA config.
+
+To pick up the new configuration you must SIGHUP (kill -1 <pid>) or restart the
+step-ca process.
 
 ## POSITIONAL ARGUMENTS
 
@@ -91,7 +101,17 @@ $ step ca provisioner remove Amazon --ca-config ca.json --type AWS
 
 Remove the ACME provisioner by name:
 '''
-$ step ca provisioner remove Amazon --ca-config ca.json --type AWS
+$ step ca provisioner remove my-acme-provisioner --type acme
+'''
+
+Remove an X5C provisioner by name:
+'''
+$ step ca provisioner remove my-x5c-provisioner --type x5c
+'''
+
+Remove a K8sSA provisioner by name:
+'''
+$ step ca provisioner remove k8sSA-default --type k8sSA
 '''`,
 	}
 }
@@ -153,7 +173,8 @@ func removeAction(ctx *cli.Context) error {
 				if clientID != "" && pp.ClientID != clientID {
 					provisioners = append(provisioners, p)
 				}
-			case *provisioner.AWS, *provisioner.Azure, *provisioner.GCP, *provisioner.ACME:
+			case *provisioner.AWS, *provisioner.Azure, *provisioner.GCP,
+				*provisioner.ACME, *provisioner.X5C, *provisioner.K8sSA:
 				// they are filtered by type and name.
 			default:
 				continue
@@ -176,7 +197,13 @@ func removeAction(ctx *cli.Context) error {
 	}
 
 	c.AuthorityConfig.Provisioners = provisioners
-	return c.Save(config)
+	if err = c.Save(config); err != nil {
+		return err
+	}
+
+	ui.Println("Success! Your `step-ca` config has been updated. To pick up the new configuration SIGHUP (kill -1 <pid>) or restart the step-ca process.")
+
+	return nil
 }
 
 // isProvisionerType returns true if p.GetType() is equal to typ. If typ is

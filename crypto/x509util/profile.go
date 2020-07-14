@@ -3,19 +3,21 @@ package x509util
 import (
 	"crypto"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha1"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/pem"
 	"math/big"
 	"net"
+	"net/url"
 	"strings"
 	"time"
 
 	"github.com/pkg/errors"
 	"github.com/smallstep/cli/crypto/keys"
 	"github.com/smallstep/cli/crypto/pemutil"
-	stepx509 "github.com/smallstep/cli/pkg/x509"
 	"github.com/smallstep/cli/utils"
 )
 
@@ -52,6 +54,10 @@ var (
 		"TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
 		"TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305",
 	}
+
+	// oidExtensionCTPoison is the OID for the certificate transparency poison
+	// extension defined in RFC6962.
+	oidExtensionCTPoison = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 11129, 2, 4, 3}
 )
 
 // Profile is an interface that certificate profiles (e.g. leaf,
@@ -70,11 +76,14 @@ type Profile interface {
 	GenerateKeyPair(string, string, int) error
 	DefaultDuration() time.Duration
 	CreateWriteCertificate(crtOut, keyOut, pass string) ([]byte, error)
+	AddExtension(pkix.Extension)
+	RemoveExtension(asn1.ObjectIdentifier)
 }
 
 type base struct {
 	iss     *x509.Certificate
 	sub     *x509.Certificate
+	ext     []pkix.Extension
 	subPub  interface{}
 	subPriv interface{}
 	issPriv interface{}
@@ -203,6 +212,30 @@ func WithEmailAddresses(emails []string) WithOption {
 	}
 }
 
+// WithURIs returns a Profile modifier which sets the URIs
+// that will be bound to the subject alternative name extension of the Certificate.
+func WithURIs(uris []*url.URL) WithOption {
+	return func(p Profile) error {
+		crt := p.Subject()
+		crt.URIs = uris
+		return nil
+	}
+}
+
+// WithSANs returns a profile modifier which set the dnsNames, emailAddresses,
+// ipAddresses, and URIs attributes of the Certificate.
+func WithSANs(sans []string) WithOption {
+	return func(p Profile) error {
+		dnsNames, ips, emails, uris := SplitSANs(sans)
+		cert := p.Subject()
+		cert.DNSNames = dnsNames
+		cert.IPAddresses = ips
+		cert.EmailAddresses = emails
+		cert.URIs = uris
+		return nil
+	}
+}
+
 // WithHosts returns a Profile modifier which sets the DNS Names and IP Addresses
 // that will be bound to the subject Certificate.
 //
@@ -224,6 +257,21 @@ func WithHosts(hosts string) WithOption {
 
 		return nil
 	}
+}
+
+// WithCTPoison returns a Profile modifier that adds the CT poison extension
+// defined in RFC6962.
+func WithCTPoison() WithOption {
+	return func(p Profile) error {
+		crt := p.Subject()
+		crt.ExtraExtensions = append(crt.ExtraExtensions, pkix.Extension{
+			Id:       oidExtensionCTPoison,
+			Critical: true,
+			Value:    asn1.NullBytes,
+		})
+		return nil
+	}
+
 }
 
 // newProfile initializes the given profile.
@@ -258,7 +306,7 @@ func newProfile(p Profile, sub, iss *x509.Certificate, issPriv crypto.PrivateKey
 	}
 
 	if sub.SubjectKeyId == nil {
-		pubBytes, err := stepx509.MarshalPKIXPublicKey(p.SubjectPublicKey())
+		pubBytes, err := x509.MarshalPKIXPublicKey(p.SubjectPublicKey())
 		if err != nil {
 			return nil, errors.Wrap(err, "failed to marshal public key to bytes")
 		}
@@ -315,6 +363,27 @@ func (b *base) SetSubjectPublicKey(pub interface{}) {
 	b.subPub = pub
 }
 
+func (b *base) AddExtension(ext pkix.Extension) {
+	b.ext = append(b.ext, ext)
+}
+
+func (b *base) RemoveExtension(oid asn1.ObjectIdentifier) {
+	for i, ext := range b.ext {
+		if ext.Id.Equal(oid) {
+			b.ext = append(b.ext[:i], b.ext[i+1:]...)
+			break
+		}
+	}
+	if b.sub != nil {
+		for i, ext := range b.sub.ExtraExtensions {
+			if ext.Id.Equal(oid) {
+				b.sub.ExtraExtensions = append(b.sub.ExtraExtensions[:i], b.sub.ExtraExtensions[i+1:]...)
+				break
+			}
+		}
+	}
+}
+
 func (b *base) DefaultDuration() time.Duration {
 	return DefaultCertValidity
 }
@@ -342,18 +411,30 @@ func (b *base) GenerateDefaultKeyPair() error {
 // CreateCertificate creates an x509 Certificate using the configuration stored
 // in the profile.
 func (b *base) CreateCertificate() ([]byte, error) {
-	if b.SubjectPublicKey() == nil {
+	pub := b.SubjectPublicKey()
+	if pub == nil {
 		return nil, errors.Errorf("Profile does not have subject public key. Need to call 'profile.GenerateKeyPair(...)' or use setters to populate keys")
 	}
 	if b.issPriv == nil {
 		return nil, errors.Errorf("Profile does not have issuer private key. Use setters to populate this field.")
 	}
 
-	sub := ToStepX509Certificate(b.Subject())
-	iss := ToStepX509Certificate(b.Issuer())
+	sub := b.Subject()
+	iss := b.Issuer()
+	if len(b.ext) > 0 {
+		sub.ExtraExtensions = append(sub.ExtraExtensions, b.ext...)
+	}
 
-	// Using stepx509 to be able to create certs with ed25519
-	bytes, err := stepx509.CreateCertificate(rand.Reader, sub, iss, b.SubjectPublicKey(), b.issPriv)
+	// Remove KeyEncipherment and DataEncipherment for non-rsa keys.
+	// See:
+	// https://github.com/golang/go/issues/36499
+	// https://tools.ietf.org/html/draft-ietf-lamps-5480-ku-clarifications-02
+	if _, ok := pub.(*rsa.PublicKey); !ok {
+		sub.KeyUsage &= ^x509.KeyUsageKeyEncipherment
+		sub.KeyUsage &= ^x509.KeyUsageDataEncipherment
+	}
+
+	bytes, err := x509.CreateCertificate(rand.Reader, sub, iss, pub, b.issPriv)
 	return bytes, errors.WithStack(err)
 }
 

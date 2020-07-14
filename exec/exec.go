@@ -3,6 +3,7 @@ package exec
 import (
 	"bytes"
 	"fmt"
+	"io/ioutil"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -13,7 +14,28 @@ import (
 	"syscall"
 
 	"github.com/pkg/errors"
+	"github.com/smallstep/cli/utils/sysutils"
 )
+
+// LookPath is an alias for exec.LookPath. It searches for an executable named
+// file in the directories named by the PATH environment variable. If file
+// contains a slash, it is tried directly and the PATH is not consulted. The
+// result may be an absolute path or a path relative to the current directory.
+func LookPath(file string) (string, error) {
+	return exec.LookPath(file)
+}
+
+// IsWSL returns true if Windows Subsystem for Linux is detected.
+//
+// "Official" way of detecting WSL
+// https://github.com/Microsoft/WSL/issues/423#issuecomment-221627364
+func IsWSL() bool {
+	b, err := ioutil.ReadFile("/proc/sys/kernel/osrelease")
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(b), "Microsoft") || strings.Contains(string(b), "WSL")
+}
 
 // Exec is wrapper over syscall.Exec, invokes the execve(2) system call. On
 // windows it executes Run with the same arguments.
@@ -23,7 +45,7 @@ func Exec(name string, arg ...string) {
 		return
 	}
 	args := append([]string{name}, arg...)
-	if err := syscall.Exec(name, args, os.Environ()); err != nil {
+	if err := sysutils.Exec(name, args, os.Environ()); err != nil {
 		errorAndExit(name, err)
 	}
 }
@@ -84,7 +106,11 @@ func OpenInBrowser(url string) error {
 	case "darwin":
 		cmd = exec.Command("open", url)
 	case "linux":
-		cmd = exec.Command("xdg-open", url)
+		if IsWSL() {
+			cmd = exec.Command("rundll32.exe", "url.dll,FileProtocolHandler", url)
+		} else {
+			cmd = exec.Command("xdg-open", url)
+		}
 	case "windows":
 		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
 	default:

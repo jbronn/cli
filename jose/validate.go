@@ -2,12 +2,95 @@ package jose
 
 import (
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/rsa"
+	"crypto/sha1"
+	"crypto/x509"
+	"encoding/base64"
 	"fmt"
+	"io/ioutil"
 
 	"github.com/pkg/errors"
-	"golang.org/x/crypto/ed25519"
+	"github.com/smallstep/cli/crypto/keys"
+	"github.com/smallstep/cli/crypto/pemutil"
+	"golang.org/x/crypto/ssh"
 )
+
+// ValidateSSHPOP validates the given SSH certificate and key for use in an
+// sshpop header.
+func ValidateSSHPOP(certFile string, key interface{}) (string, error) {
+	if certFile == "" {
+		return "", errors.New("ssh certfile cannot be empty")
+	}
+	certBytes, err := ioutil.ReadFile(certFile)
+	if err != nil {
+		return "", errors.Wrapf(err, "error reading ssh certificate from %s", certFile)
+	}
+	sshpub, _, _, _, err := ssh.ParseAuthorizedKey(certBytes)
+	if err != nil {
+		return "", errors.Wrapf(err, "error parsing ssh public key from %s", certFile)
+	}
+	cert, ok := sshpub.(*ssh.Certificate)
+	if !ok {
+		return "", errors.New("error casting ssh public key to ssh certificate")
+	}
+	pubkey, err := keys.ExtractKey(cert)
+	if err != nil {
+		return "", errors.Wrap(err, "error extracting public key from ssh public key interface")
+	}
+	if err = keys.VerifyPair(pubkey, key); err != nil {
+		return "", errors.Wrap(err, "error verifying ssh key pair")
+	}
+
+	return base64.StdEncoding.EncodeToString(cert.Marshal()), nil
+}
+
+func validateX5(certFile string, key interface{}) ([]*x509.Certificate, error) {
+	if certFile == "" {
+		return nil, errors.New("certfile cannot be empty")
+	}
+	certs, err := pemutil.ReadCertificateBundle(certFile)
+	if err != nil {
+		return nil, errors.Wrap(err, "error reading certificate chain from file")
+	}
+
+	if err = keys.VerifyPair(certs[0].PublicKey, key); err != nil {
+		return nil, errors.Wrap(err, "error verifying certificate and key")
+	}
+
+	if certs[0].KeyUsage&x509.KeyUsageDigitalSignature == 0 {
+		return nil, errors.New("certificate/private-key pair used to sign " +
+			"token is not approved for digital signature")
+	}
+	return certs, nil
+}
+
+// ValidateX5C validates the given certificate chain and key for use as a token
+// signer and x5t header.
+func ValidateX5C(certFile string, key interface{}) ([]string, error) {
+	certs, err := validateX5(certFile, key)
+	if err != nil {
+		return nil, errors.Wrap(err, "ValidateX5C")
+	}
+	strs := make([]string, len(certs))
+	for i, cert := range certs {
+		strs[i] = base64.StdEncoding.EncodeToString(cert.Raw)
+	}
+	return strs, nil
+}
+
+// ValidateX5T validates the given certificate and key for use as a token signer
+// and x5t header.
+func ValidateX5T(certFile string, key interface{}) (string, error) {
+	certs, err := validateX5(certFile, key)
+	if err != nil {
+		return "", errors.Wrap(err, "ValidateX5T")
+	}
+	// x5t is the base64 URL encoded SHA1 thumbprint
+	// (see https://tools.ietf.org/html/rfc7515#section-4.1.7)
+	fingerprint := sha1.Sum(certs[0].Raw)
+	return base64.URLEncoding.EncodeToString(fingerprint[:]), nil
+}
 
 // ValidateJWK validates the given JWK.
 func ValidateJWK(jwk *JSONWebKey) error {

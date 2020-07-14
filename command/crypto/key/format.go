@@ -3,10 +3,10 @@ package key
 import (
 	"bytes"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
-	"io/ioutil"
 	"os"
 
 	"github.com/pkg/errors"
@@ -17,7 +17,6 @@ import (
 	"github.com/smallstep/cli/ui"
 	"github.com/smallstep/cli/utils"
 	"github.com/urfave/cli"
-	"golang.org/x/crypto/ed25519"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -117,7 +116,7 @@ $ step crypto key format --der --pkcs8 key.der --out key-pkcs8.der
 			},
 			cli.BoolFlag{
 				Name:  "ssh",
-				Usage: `Uses OpenSSH as the result encoding format on public keys.`,
+				Usage: `Uses OpenSSH as the result encoding format.`,
 			},
 			cli.StringFlag{
 				Name:  "out",
@@ -140,12 +139,21 @@ Requires **--insecure** flag.`,
 }
 
 func formatAction(ctx *cli.Context) error {
-	if err := errs.NumberOfArguments(ctx, 1); err != nil {
+	if err := errs.MinMaxNumberOfArguments(ctx, 0, 1); err != nil {
 		return err
 	}
 
+	var keyFile string
+	switch ctx.NArg() {
+	case 0:
+		keyFile = "-"
+	case 1:
+		keyFile = ctx.Args().First()
+	default:
+		return errs.TooManyArguments(ctx)
+	}
+
 	var (
-		keyFile    = ctx.Args().Get(0)
 		out        = ctx.String("out")
 		toPEM      = ctx.Bool("pem")
 		toDER      = ctx.Bool("der")
@@ -166,7 +174,7 @@ func formatAction(ctx *cli.Context) error {
 		return errs.RequiredInsecureFlag(ctx, "no-password")
 	}
 
-	b, err := ioutil.ReadFile(keyFile)
+	b, err := utils.ReadFile(keyFile)
 	if err != nil {
 		return errs.FileError(err, keyFile)
 	}
@@ -313,7 +321,21 @@ func convertToSSH(ctx *cli.Context, key interface{}) ([]byte, error) {
 		}
 		return ssh.MarshalAuthorizedKey(k), nil
 	case *rsa.PrivateKey, *ecdsa.PrivateKey, ed25519.PrivateKey:
-		return nil, errors.New("ssh format is only supported on public keys")
+		opts := []pemutil.Options{
+			pemutil.WithOpenSSH(true),
+		}
+		if !ctx.Bool("no-password") {
+			if passFile := ctx.String("password-file"); passFile != "" {
+				opts = append(opts, pemutil.WithPasswordFile(passFile))
+			} else {
+				opts = append(opts, pemutil.WithPasswordPrompt("Please enter the password to encrypt the private key"))
+			}
+		}
+		block, err := pemutil.Serialize(key, opts...)
+		if err != nil {
+			return nil, err
+		}
+		return pem.EncodeToMemory(block), nil
 	default:
 		return nil, errors.Errorf("unsupported key type %T", key)
 	}
