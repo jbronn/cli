@@ -18,15 +18,16 @@ import (
 	"github.com/pkg/errors"
 	"github.com/smallstep/certificates/api"
 	"github.com/smallstep/certificates/ca"
+	"github.com/smallstep/certificates/pki"
 	"github.com/smallstep/cli/command"
 	"github.com/smallstep/cli/crypto/pemutil"
-	"github.com/smallstep/cli/crypto/pki"
 	"github.com/smallstep/cli/crypto/x509util"
 	"github.com/smallstep/cli/errs"
 	"github.com/smallstep/cli/flags"
 	"github.com/smallstep/cli/ui"
 	"github.com/smallstep/cli/utils"
 	"github.com/smallstep/cli/utils/cautils"
+	"github.com/smallstep/cli/utils/sysutils"
 	"github.com/urfave/cli"
 )
 
@@ -270,7 +271,7 @@ func renewCertificateAction(ctx *cli.Context) error {
 	// Do not renew if (cert.notAfter - now) > (expiresIn + jitter)
 	if expiresIn > 0 {
 		jitter := rand.Int63n(int64(expiresIn / 20))
-		if d := leaf.NotAfter.Sub(time.Now()); d > expiresIn+time.Duration(jitter) {
+		if d := time.Until(leaf.NotAfter); d > expiresIn+time.Duration(jitter) {
 			ui.Printf("certificate not renewed: expires in %s\n", d.Round(time.Second))
 			return nil
 		}
@@ -287,7 +288,7 @@ func renewCertificateAction(ctx *cli.Context) error {
 func nextRenewDuration(leaf *x509.Certificate, expiresIn, renewPeriod time.Duration) time.Duration {
 	if renewPeriod > 0 {
 		// Renew now if it will be expired in renewPeriod
-		if (leaf.NotAfter.Sub(time.Now()) - renewPeriod) <= 0 {
+		if (time.Until(leaf.NotAfter) - renewPeriod) <= 0 {
 			return 0
 		}
 		return renewPeriod
@@ -298,7 +299,7 @@ func nextRenewDuration(leaf *x509.Certificate, expiresIn, renewPeriod time.Durat
 		expiresIn = period / 3
 	}
 
-	d := leaf.NotAfter.Sub(time.Now()) - expiresIn
+	d := time.Until(leaf.NotAfter) - expiresIn
 	n := rand.Int63n(int64(period / 20))
 	d -= time.Duration(n)
 	if d < 0 {
@@ -320,7 +321,7 @@ func runKillPid(pid, signum int) error {
 	if pid == 0 {
 		return nil
 	}
-	if err := syscall.Kill(pid, syscall.Signal(signum)); err != nil {
+	if err := sysutils.Kill(pid, syscall.Signal(signum)); err != nil {
 		return errors.Wrapf(err, "kill %d with signal %d failed", pid, signum)
 	}
 	return nil
@@ -400,16 +401,17 @@ func (r *renewer) Renew(outFile string) (*api.SignResponse, error) {
 		return nil, errors.Wrap(err, "error renewing certificate")
 	}
 
-	serverBlock, err := pemutil.Serialize(resp.ServerPEM.Certificate)
-	if err != nil {
-		return nil, err
+	if resp.CertChainPEM == nil || len(resp.CertChainPEM) == 0 {
+		resp.CertChainPEM = []api.Certificate{resp.ServerPEM, resp.CaPEM}
 	}
-	caBlock, err := pemutil.Serialize(resp.CaPEM.Certificate)
-	if err != nil {
-		return nil, err
+	var data []byte
+	for _, certPEM := range resp.CertChainPEM {
+		pemblk, err := pemutil.Serialize(certPEM.Certificate)
+		if err != nil {
+			return nil, errors.Wrap(err, "error serializing certificate PEM")
+		}
+		data = append(data, pem.EncodeToMemory(pemblk)...)
 	}
-	data := append(pem.EncodeToMemory(serverBlock), pem.EncodeToMemory(caBlock)...)
-
 	if err := utils.WriteFile(outFile, data, 0600); err != nil {
 		return nil, errs.FileError(err, outFile)
 	}
@@ -417,8 +419,11 @@ func (r *renewer) Renew(outFile string) (*api.SignResponse, error) {
 	return resp, nil
 }
 
+// RenewAndPrepareNext renews the cert and prepares the cert for it's next renewal.
+// NOTE: this function logs each time the certificate is successfully renewed.
 func (r *renewer) RenewAndPrepareNext(outFile string, expiresIn, renewPeriod time.Duration) (time.Duration, error) {
 	const durationOnErrors = 1 * time.Minute
+	Info := log.New(os.Stdout, "INFO: ", log.LstdFlags)
 
 	resp, err := r.Renew(outFile)
 	if err != nil {
@@ -437,7 +442,9 @@ func (r *renewer) RenewAndPrepareNext(outFile string, expiresIn, renewPeriod tim
 	r.transport.TLSClientConfig.Certificates = []tls.Certificate{cert}
 
 	// Get next renew duration
-	return nextRenewDuration(resp.ServerPEM.Certificate, expiresIn, renewPeriod), nil
+	next := nextRenewDuration(resp.ServerPEM.Certificate, expiresIn, renewPeriod)
+	Info.Printf("%s certificate renewed, next in %s", resp.ServerPEM.Certificate.Subject.CommonName, next.Round(time.Second))
+	return next, nil
 }
 
 func (r *renewer) Daemon(outFile string, next, expiresIn, renewPeriod time.Duration, afterRenew func() error) error {
@@ -456,28 +463,19 @@ func (r *renewer) Daemon(outFile string, next, expiresIn, renewPeriod time.Durat
 		case sig := <-signals:
 			switch sig {
 			case syscall.SIGHUP:
-				if n, err := r.RenewAndPrepareNext(outFile, expiresIn, renewPeriod); err != nil {
+				if _, err := r.RenewAndPrepareNext(outFile, expiresIn, renewPeriod); err != nil {
 					Error.Println(err)
-				} else {
-					next = n
-					Info.Printf("certificate renewed, next in %s", next.Round(time.Second))
-					if err := afterRenew(); err != nil {
-						Error.Println(err)
-					}
+				} else if err := afterRenew(); err != nil {
+					Error.Println(err)
 				}
 			case syscall.SIGINT, syscall.SIGTERM:
 				return nil
 			}
 		case <-time.After(next):
-			if n, err := r.RenewAndPrepareNext(outFile, expiresIn, renewPeriod); err != nil {
-				next = n
+			if _, err := r.RenewAndPrepareNext(outFile, expiresIn, renewPeriod); err != nil {
 				Error.Println(err)
-			} else {
-				next = n
-				Info.Printf("certificate renewed, next in %s", next.Round(time.Second))
-				if err := afterRenew(); err != nil {
-					Error.Println(err)
-				}
+			} else if err := afterRenew(); err != nil {
+				Error.Println(err)
 			}
 		}
 	}

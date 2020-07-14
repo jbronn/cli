@@ -2,6 +2,7 @@ package certificate
 
 import (
 	"crypto/rand"
+	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
 
@@ -12,7 +13,6 @@ import (
 	"github.com/smallstep/cli/crypto/x509util"
 	"github.com/smallstep/cli/errs"
 	"github.com/smallstep/cli/flags"
-	stepx509 "github.com/smallstep/cli/pkg/x509"
 	"github.com/smallstep/cli/ui"
 	"github.com/smallstep/cli/utils"
 	"github.com/urfave/cli"
@@ -179,10 +179,10 @@ recommended. Requires **--insecure** flag.`,
 : <profile> is a case-sensitive string and must be one of:
 
     **leaf**
-	:  Generate a leaf x.509 certificate suitable for use with TLs.
+	:  Generate a leaf x.509 certificate suitable for use with TLS.
 
     **intermediate-ca**
-    :  Generate a certificate that can be used to sign additional leaf or intermediate certificates.
+    :  Generate a certificate that can be used to sign additional leaf certificates.
 
     **root-ca**
     :  Generate a new self-signed root certificate suitable for use as a root CA.
@@ -270,10 +270,6 @@ func createAction(ctx *cli.Context) error {
 	}
 
 	sans := ctx.StringSlice("san")
-	if len(sans) == 0 {
-		sans = []string{subject}
-	}
-	dnsNames, ips, emails := x509util.SplitSANs(sans)
 
 	var (
 		priv       interface{}
@@ -294,16 +290,21 @@ func createAction(ctx *cli.Context) error {
 			return errors.WithStack(err)
 		}
 
-		_csr := &stepx509.CertificateRequest{
+		if len(sans) == 0 {
+			sans = []string{subject}
+		}
+		dnsNames, ips, emails, uris := x509util.SplitSANs(sans)
+
+		csr := &x509.CertificateRequest{
 			Subject: pkix.Name{
 				CommonName: subject,
 			},
 			DNSNames:       dnsNames,
 			IPAddresses:    ips,
 			EmailAddresses: emails,
+			URIs:           uris,
 		}
-		var csrBytes []byte
-		csrBytes, err = stepx509.CreateCertificateRequest(rand.Reader, _csr, priv)
+		csrBytes, err := x509.CreateCertificateRequest(rand.Reader, csr, priv)
 		if err != nil {
 			return errors.WithStack(err)
 		}
@@ -321,6 +322,13 @@ func createAction(ctx *cli.Context) error {
 			caKeyPath = ctx.String("ca-key")
 			profile   x509util.Profile
 		)
+
+		// If the certificate is a leaf certificate (applies to self-signed leaf
+		// certs) then make sure it gets a default SAN equivalent to the CN if
+		// no other SANs were submitted.
+		if (len(sans) == 0) && ((prof == "leaf") || (prof == "self-signed")) {
+			sans = []string{subject}
+		}
 		if bundle && prof != "leaf" {
 			return errs.IncompatibleFlagValue(ctx, "bundle", "profile", prof)
 		}
@@ -342,9 +350,7 @@ func createAction(ctx *cli.Context) error {
 				profile, err = x509util.NewLeafProfile(subject, issIdentity.Crt,
 					issIdentity.Key, x509util.GenerateKeyPair(kty, crv, size),
 					x509util.WithNotBeforeAfterDuration(notBefore, notAfter, 0),
-					x509util.WithDNSNames(dnsNames),
-					x509util.WithIPAddresses(ips),
-					x509util.WithEmailAddresses(emails))
+					x509util.WithSANs(sans))
 				if err != nil {
 					return errors.WithStack(err)
 				}
@@ -358,9 +364,7 @@ func createAction(ctx *cli.Context) error {
 					issIdentity.Crt, issIdentity.Key,
 					x509util.GenerateKeyPair(kty, crv, size),
 					x509util.WithNotBeforeAfterDuration(notBefore, notAfter, 0),
-					x509util.WithDNSNames(dnsNames),
-					x509util.WithIPAddresses(ips),
-					x509util.WithEmailAddresses(emails))
+					x509util.WithSANs(sans))
 				if err != nil {
 					return errors.WithStack(err)
 				}
@@ -369,9 +373,7 @@ func createAction(ctx *cli.Context) error {
 			profile, err = x509util.NewRootProfile(subject,
 				x509util.GenerateKeyPair(kty, crv, size),
 				x509util.WithNotBeforeAfterDuration(notBefore, notAfter, 0),
-				x509util.WithDNSNames(dnsNames),
-				x509util.WithIPAddresses(ips),
-				x509util.WithEmailAddresses(emails))
+				x509util.WithSANs(sans))
 			if err != nil {
 				return errors.WithStack(err)
 			}
@@ -382,9 +384,7 @@ func createAction(ctx *cli.Context) error {
 			profile, err = x509util.NewSelfSignedLeafProfile(subject,
 				x509util.GenerateKeyPair(kty, crv, size),
 				x509util.WithNotBeforeAfterDuration(notBefore, notAfter, 0),
-				x509util.WithDNSNames(dnsNames),
-				x509util.WithIPAddresses(ips),
-				x509util.WithEmailAddresses(emails))
+				x509util.WithSANs(sans))
 			if err != nil {
 				return errors.WithStack(err)
 			}

@@ -11,12 +11,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/urfave/cli"
-
+	"github.com/smallstep/certificates/ca"
 	"github.com/smallstep/cli/command"
 	"github.com/smallstep/cli/command/version"
 	"github.com/smallstep/cli/config"
+	"github.com/smallstep/cli/errs"
 	"github.com/smallstep/cli/usage"
+	"github.com/urfave/cli"
 
 	// Enabled commands
 	_ "github.com/smallstep/cli/command/base64"
@@ -42,6 +43,7 @@ var BuildTime = "N/A"
 
 func init() {
 	config.Set("Smallstep CLI", Version, BuildTime)
+	ca.UserAgent = config.Version()
 	rand.Seed(time.Now().UnixNano())
 }
 
@@ -67,7 +69,7 @@ func main() {
 	app.Commands = command.Retrieve()
 	app.Flags = append(app.Flags, cli.HelpFlag)
 	app.EnableBashCompletion = true
-	app.Copyright = "(c) 2019 Smallstep Labs, Inc."
+	app.Copyright = "(c) 2018-2020 Smallstep Labs, Inc."
 
 	// Flag of custom configuration flag
 	app.Flags = append(app.Flags, cli.StringFlag{
@@ -89,10 +91,19 @@ func main() {
 	}
 
 	if err := app.Run(os.Args); err != nil {
-		if os.Getenv("STEPDEBUG") == "1" {
-			fmt.Fprintf(os.Stderr, "%+v\n", err)
+		if fe, ok := err.(errs.FriendlyError); ok {
+			if os.Getenv("STEPDEBUG") == "1" {
+				fmt.Fprintf(os.Stderr, "%+v\n\n%s", err, fe.Message())
+			} else {
+				fmt.Fprintln(os.Stderr, fe.Message())
+				fmt.Fprintln(os.Stderr, "Re-run with STEPDEBUG=1 for more info.")
+			}
 		} else {
-			fmt.Fprintln(os.Stderr, err)
+			if os.Getenv("STEPDEBUG") == "1" {
+				fmt.Fprintf(os.Stderr, "%+v\n", err)
+			} else {
+				fmt.Fprintln(os.Stderr, err)
+			}
 		}
 		os.Exit(1)
 	}

@@ -2,19 +2,23 @@ package jose
 
 import (
 	"bytes"
+	"crypto"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rsa"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/pkg/errors"
 	"github.com/smallstep/cli/crypto/pemutil"
 	"github.com/smallstep/cli/ui"
-	"golang.org/x/crypto/ed25519"
 	jose "gopkg.in/square/go-jose.v2"
 )
 
@@ -63,6 +67,19 @@ func Decrypt(prompt string, data []byte, opts ...Option) ([]byte, error) {
 	return nil, errors.New("failed to decrypt JWK: invalid password")
 }
 
+func defKeyID(jwk *JSONWebKey) error {
+	var (
+		err  error
+		hash []byte
+	)
+	hash, err = jwk.Thumbprint(crypto.SHA256)
+	if err != nil {
+		return errors.Wrap(err, "error generating JWK thumbprint")
+	}
+	jwk.KeyID = base64.RawURLEncoding.EncodeToString(hash)
+	return nil
+}
+
 // ParseKey returns a JSONWebKey from the given JWK file or a PEM file. For
 // password protected keys, it will ask the user for a password.
 // func ParseKey(filename, use, alg, kid string, subtle bool) (*JSONWebKey, error) {
@@ -90,13 +107,28 @@ func ParseKey(filename string, opts ...Option) (*JSONWebKey, error) {
 		if err = json.Unmarshal(b, jwk); err != nil {
 			return nil, errors.Errorf("error reading %s: unsupported format", filename)
 		}
+
+	// If KeyID not set by environment, then use the default.
+	// NOTE: we do not set this value by default in the case of jwkKeyType
+	// because it is assumed to have been left empty on purpose.
 	case pemKeyType:
 		jwk.Key, err = pemutil.ParseKey(b, pemutil.WithFilename(filename), pemutil.WithPassword(ctx.password))
 		if err != nil {
 			return nil, err
 		}
+		if len(ctx.kid) == 0 {
+			if err = defKeyID(jwk); err != nil {
+				return nil, err
+			}
+		}
+
 	case octKeyType:
 		jwk.Key = b
+		if len(ctx.kid) == 0 {
+			if err = defKeyID(jwk); err != nil {
+				return nil, err
+			}
+		}
 	}
 
 	// Validate key id
@@ -193,6 +225,87 @@ func ParseKeySet(filename string, opts ...Option) (*jose.JSONWebKey, error) {
 	default:
 		return nil, errors.Errorf("multiple keys with kid %s have been found on %s", ctx.kid, filename)
 	}
+}
+
+func decodeCerts(l []interface{}) ([]*x509.Certificate, error) {
+	certs := make([]*x509.Certificate, len(l))
+	for i, j := range l {
+		certStr, ok := j.(string)
+		if !ok {
+			return nil, errors.Errorf("wrong type in x5c header list; expected string but %T", i)
+		}
+		certB, err := base64.StdEncoding.DecodeString(certStr)
+		if err != nil {
+			return nil, errors.Wrap(err, "error decoding base64 encoded x5c cert")
+		}
+		cert, err := x509.ParseCertificate(certB)
+		if err != nil {
+			return nil, errors.Wrap(err, "error parsing x5c cert")
+		}
+		certs[i] = cert
+	}
+	return certs, nil
+}
+
+// X5cInsecureKey is the key used to store the x5cInsecure cert chain in the JWT header.
+var X5cInsecureKey = "x5cInsecure"
+
+// GetX5cInsecureHeader extracts the x5cInsecure certificate chain from the token.
+func GetX5cInsecureHeader(jwt *JSONWebToken) ([]*x509.Certificate, error) {
+	x5cVal, ok := jwt.Headers[0].ExtraHeaders[jose.HeaderKey(X5cInsecureKey)]
+	if !ok {
+		return nil, errors.New("ssh check-host token missing x5cInsecure header")
+	}
+	interfaces, ok := x5cVal.([]interface{})
+	if !ok {
+		return nil, errors.Errorf("ssh check-host token x5cInsecure header has wrong type; expected []string, but got %T", x5cVal)
+	}
+	chain, err := decodeCerts(interfaces)
+	if err != nil {
+		return nil, errors.Wrap(err, "error decoding x5cInsecure header certs")
+	}
+	return chain, nil
+}
+
+// ParseX5cInsecure parses an x5cInsecure token, validates the certificate chain
+// in the token, and returns the JWT struct along with all the verified chains.
+func ParseX5cInsecure(tok string, roots []*x509.Certificate) (*JSONWebToken, [][]*x509.Certificate, error) {
+	jwt, err := ParseSigned(tok)
+	if err != nil {
+		return nil, nil, errors.Wrapf(err, "error parsing x5cInsecure token")
+	}
+
+	chain, err := GetX5cInsecureHeader(jwt)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "error extracting x5cInsecure cert chain")
+	}
+	leaf := chain[0]
+
+	interPool := x509.NewCertPool()
+	for _, crt := range chain[1:] {
+		interPool.AddCert(crt)
+	}
+	rootPool := x509.NewCertPool()
+	for _, crt := range roots {
+		rootPool.AddCert(crt)
+	}
+	// Correctly parse and validate the x5c certificate chain.
+	verifiedChains, err := leaf.Verify(x509.VerifyOptions{
+		Roots:         rootPool,
+		Intermediates: interPool,
+		// A hack so we skip validity period validation.
+		CurrentTime: leaf.NotAfter.Add(-1 * time.Minute),
+	})
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "error verifying x5cInsecure certificate chain")
+	}
+	leaf = verifiedChains[0][0]
+
+	if leaf.KeyUsage&x509.KeyUsageDigitalSignature == 0 {
+		return nil, nil, errors.New("certificate used to sign x5cInsecure token cannot be used for digital signature")
+	}
+
+	return jwt, verifiedChains, nil
 }
 
 // guessKeyType returns the key type of the given data. Key types are JWK, PEM

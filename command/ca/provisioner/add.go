@@ -1,12 +1,19 @@
 package provisioner
 
 import (
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
+	"io/ioutil"
 	"net/url"
 	"strings"
 
 	"github.com/pkg/errors"
 	"github.com/smallstep/certificates/authority"
 	"github.com/smallstep/certificates/authority/provisioner"
+	"github.com/smallstep/cli/crypto/pemutil"
 	"github.com/smallstep/cli/errs"
 	"github.com/smallstep/cli/flags"
 	"github.com/smallstep/cli/jose"
@@ -28,28 +35,31 @@ func addCommand() cli.Command {
 [**--configuration-endpoint**=<url>] [**--domain**=<domain>]
 [**--admin**=<email>]...
 
-**step ca provisioner add** <name> **--type**=[AWS|Azure|GCP] **--ca-config**=<file>
-[**--aws-account**=<id>]
+**step ca provisioner add** <name> **--type**=x5c **--x5c-root**=<file>
+[**--ca-config**=<file>]...
+
+**step ca provisioner add** <name> **--type**=k8sSA
+[**--pem-keys=<file>**] [**--ca-config**=<file>]...
+
+**step ca provisioner add** <name> **--type**=[AWS|Azure|GCP]
+[**--ca-config**=<file>] [**--aws-account**=<id>]
 [**--gcp-service-account**=<name>] [**--gcp-project**=<name>]
 [**--azure-tenant**=<id>] [**--azure-resource-group**=<name>]
 [**--instance-age**=<duration>] [**--disable-custom-sans**] [**--disable-trust-on-first-use**]
 
 **step ca provisioner add** <name> **--type**=ACME **--ca-config**=<file>`,
 		Flags: []cli.Flag{
-			cli.StringFlag{
-				Name:  "ca-config",
-				Usage: "The <file> containing the CA configuration.",
-			},
+			flags.CaConfig,
 			cli.StringFlag{
 				Name:  "type",
 				Value: provisioner.TypeJWK.String(),
 				Usage: `The <type> of provisioner to create. Type is a case-insensitive string
 and must be one of:
     **JWK**
-    : Uses an JWK key pair to sign bootstrap tokens. (default)
+    : Uses an JWK key pair to sign provisioning tokens. (default)
 
     **OIDC**
-    : Uses an OpenID Connect provider to sign bootstrap tokens.
+    : Uses an OpenID Connect provider to sign provisioning tokens.
 
     **AWS**
     : Uses Amazon AWS instance identity documents.
@@ -62,13 +72,28 @@ and must be one of:
 
     **ACME**
     : Uses the ACME protocol to create certificates.
-`,
+
+    **X5C**
+    : Uses an X509 Certificate / private key pair to sign provisioning tokens.
+
+    **K8sSA**
+    : Uses Kubernetes Service Account tokens.
+
+    **SSHPOP**
+    : Uses an SSH Certificate / private key pair to sign provisioning tokens.`,
 			},
+			flags.PasswordFile,
 			cli.BoolFlag{
 				Name: "create",
 				Usage: `Create a new ECDSA key pair using curve P-256 and populate a new JWK
 provisioner with it.`,
 			},
+			cli.BoolFlag{
+				Name:  "ssh",
+				Usage: `Enable SSH on the new provisioners.`,
+			},
+
+			// OIDC provisioner flags
 			cli.StringFlag{
 				Name:  "client-id",
 				Usage: `The <id> used to validate the audience in an OpenID Connect token.`,
@@ -76,6 +101,10 @@ provisioner with it.`,
 			cli.StringFlag{
 				Name:  "client-secret",
 				Usage: `The <secret> used to obtain the OpenID Connect tokens.`,
+			},
+			cli.StringFlag{
+				Name:  "listen-address",
+				Usage: `The callback <address> used in the OpenID Connect flow (e.g. \":10000\")`,
 			},
 			cli.StringFlag{
 				Name:  "configuration-endpoint",
@@ -92,11 +121,21 @@ will not have restrictions in the certificates to sign. Use the
 				Usage: `The <domain> used to validate the email claim in an OpenID Connect provisioner.
 Use the '--domain' flag multiple times to configure multiple domains.`,
 			},
-			flags.PasswordFile,
+
+			// Cloud provisioner flags
 			cli.StringSliceFlag{
 				Name: "aws-account",
 				Usage: `The AWS account <id> used to validate the identity documents.
 Use the flag multiple times to configure multiple accounts.`,
+			},
+			cli.StringFlag{
+				Name:  "azure-tenant",
+				Usage: `The Microsoft Azure tenant <id> used to validate the identity tokens.`,
+			},
+			cli.StringSliceFlag{
+				Name: "azure-resource-group",
+				Usage: `The Microsoft Azure resource group <name> used to validate the identity tokens.
+Use the flag multipl etimes to configure multiple resource groups`,
 			},
 			cli.StringSliceFlag{
 				Name: "gcp-service-account",
@@ -107,15 +146,6 @@ Use the flag multiple times to configure multiple service accounts.`,
 				Name: "gcp-project",
 				Usage: `The Google project <id> used to validate the identity tokens.
 Use the flag multipl etimes to configure multiple projects`,
-			},
-			cli.StringFlag{
-				Name:  "azure-tenant",
-				Usage: `The Microsoft Azure tenant <id> used to validate the identity tokens.`,
-			},
-			cli.StringSliceFlag{
-				Name: "azure-resource-group",
-				Usage: `The Microsoft Azure resource group <name> used to validate the identity tokens.
-Use the flag multipl etimes to configure multiple resource groups`,
 			},
 			cli.DurationFlag{
 				Name: "instance-age",
@@ -135,13 +165,26 @@ By default it will accept any SAN in the CSR.`,
 with the same instance will be accepted. By default only the first request
 will be accepted.`,
 			},
-			cli.BoolFlag{
-				Name:  "ssh",
-				Usage: `Enable SSH on the new provisioners.`,
+
+			// X5C provisioner flags
+			cli.StringFlag{
+				Name: "x5c-root",
+				Usage: `Root certificate (chain) <file> used to validate the signature on X5C
+provisioning tokens.`,
+			},
+			// K8sSA provisioner flags
+			cli.StringFlag{
+				Name: "pem-keys",
+				Usage: `Public key <file> for validating signatures on K8s Service Account Tokens.
+PEM formatted bundle (can have multiple PEM blocks in the same file) of public
+keys and x509 Certificates.`,
 			},
 		},
 		Description: `**step ca provisioner add** adds one or more provisioners
 to the configuration and writes the new configuration back to the CA config.
+
+To pick up the new configuration you must SIGHUP (kill -1 <pid>) or restart the
+step-ca process.
 
 ## POSITIONAL ARGUMENTS
 
@@ -225,10 +268,26 @@ document and will allow multiple certificates from the same instance:
 '''
 $ step ca provisioner add Amazon --type AWS --ca-config ca.json \
   --aws-account 123456789 --disable-custom-sans --disable-trust-on-first-use
+'''
 
 Add an ACME provisioner.
 '''
-$ step ca provisioner add acme-smallstep --type ACME --ca-config ca.json
+$ step ca provisioner add acme-smallstep --type ACME
+'''
+
+Add an X5C provisioner.
+'''
+$ step ca provisioner add x5c-smallstep --type X5C --x5c-root x5cRoot.crt
+'''
+
+Add a K8s Service Account provisioner.
+'''
+$ step ca provisioner add my-kube-provisioner --type K8sSA --pem-keys keys.pub
+'''
+
+Add an SSH-POP provisioner.
+'''
+$ step ca provisioner add sshpop-smallstep --type SSHPOP
 '''`,
 	}
 }
@@ -275,6 +334,12 @@ func addAction(ctx *cli.Context) (err error) {
 		list, err = addGCPProvisioner(ctx, name, provMap)
 	case provisioner.TypeACME:
 		list, err = addACMEProvisioner(ctx, name, provMap)
+	case provisioner.TypeX5C:
+		list, err = addX5CProvisioner(ctx, name, provMap)
+	case provisioner.TypeK8sSA:
+		list, err = addK8sSAProvisioner(ctx, name, provMap)
+	case provisioner.TypeSSHPOP:
+		list, err = addSSHPOPProvisioner(ctx, name, provMap)
 	default:
 		return errors.Errorf("unknown type %s: this should not happen", typ)
 	}
@@ -284,7 +349,13 @@ func addAction(ctx *cli.Context) (err error) {
 	}
 
 	c.AuthorityConfig.Provisioners = append(c.AuthorityConfig.Provisioners, list...)
-	return c.Save(config)
+	if err = c.Save(config); err != nil {
+		return err
+	}
+
+	ui.Println("Success! Your `step-ca` config has been updated. To pick up the new configuration SIGHUP (kill -1 <pid>) or restart the step-ca process.")
+
+	return nil
 }
 
 func addJWKProvisioner(ctx *cli.Context, name string, provMap map[string]bool) (list provisioner.List, err error) {
@@ -411,6 +482,7 @@ func addOIDCProvisioner(ctx *cli.Context, name string, provMap map[string]bool) 
 		Admins:                ctx.StringSlice("admin"),
 		Domains:               ctx.StringSlice("domain"),
 		Claims:                getClaims(ctx),
+		ListenAddress:         ctx.String("listen-address"),
 	}
 	// Check for duplicates
 	if _, ok := provMap[p.GetID()]; !ok {
@@ -522,6 +594,132 @@ func addACMEProvisioner(ctx *cli.Context, name string, provMap map[string]bool) 
 	return
 }
 
+func addX5CProvisioner(ctx *cli.Context, name string, provMap map[string]bool) (list provisioner.List, err error) {
+	x5cRootFile := ctx.String("x5c-root")
+	if len(x5cRootFile) == 0 {
+		return nil, errs.RequiredWithFlagValue(ctx, "type", "x5c", "x5c-root")
+	}
+
+	roots, err := pemutil.ReadCertificateBundle(x5cRootFile)
+	if err != nil {
+		return nil, errors.Wrapf(err, "error loading X5C Root certificates from %s", x5cRootFile)
+	}
+	var rootBytes []byte
+	for _, r := range roots {
+		if r.KeyUsage&x509.KeyUsageCertSign == 0 {
+			return nil, errors.Errorf("error: certificate with common name '%s' cannot be "+
+				"used as an X5C root certificate.\n\n"+
+				"X5C provisioner root certificates must have the 'Certificate Sign' key "+
+				"usage extension.", r.Subject.CommonName)
+		}
+		rootBytes = append(rootBytes, pem.EncodeToMemory(&pem.Block{
+			Type:  "CERTIFICATE",
+			Bytes: r.Raw,
+		})...)
+	}
+	p := &provisioner.X5C{
+		Type:   provisioner.TypeX5C.String(),
+		Name:   name,
+		Claims: getClaims(ctx),
+		Roots:  rootBytes,
+	}
+
+	// Check for duplicates
+	if _, ok := provMap[p.GetID()]; !ok {
+		provMap[p.GetID()] = true
+	} else {
+		return nil, errors.Errorf("duplicated provisioner: CA config already contains a provisioner with ID=%s", p.GetID())
+	}
+
+	list = append(list, p)
+	return
+}
+
+// addK8sSAProvisioner returns a provisioner list containing a kubernetes
+// service account provisioner.
+// NOTE: step-ca currently only supports one k8sSA provisioner (because we do
+// not have a good way of distinguishing between tokens), therefore w/e `name`
+// is entered by the user will be overwritten by a default value.
+func addK8sSAProvisioner(ctx *cli.Context, name string, provMap map[string]bool) (list provisioner.List, err error) {
+	pemKeysF := ctx.String("pem-keys")
+	if len(pemKeysF) == 0 {
+		return nil, errs.RequiredWithFlagValue(ctx, "type", "k8sSA", "pem-keys")
+	}
+
+	pemKeysB, err := ioutil.ReadFile(pemKeysF)
+	if err != nil {
+		return nil, errors.Wrap(err, "error reading pem keys")
+	}
+
+	var (
+		block   *pem.Block
+		rest    = pemKeysB
+		pemKeys = []interface{}{}
+	)
+	for rest != nil {
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		key, err := pemutil.ParseKey(pem.EncodeToMemory(block))
+		if err != nil {
+			return nil, errors.Wrapf(err, "error parsing public key from %s", pemKeysF)
+		}
+		switch q := key.(type) {
+		case *rsa.PublicKey, *ecdsa.PublicKey, ed25519.PublicKey:
+		default:
+			return nil, errors.Errorf("Unexpected public key type %T in %s", q, pemKeysF)
+		}
+		pemKeys = append(pemKeys, key)
+	}
+
+	var pubKeyBytes []byte
+	for _, k := range pemKeys {
+		blk, err := pemutil.Serialize(k)
+		if err != nil {
+			return nil, errors.Wrap(err, "error serializing pem key")
+		}
+		pubKeyBytes = append(pubKeyBytes, pem.EncodeToMemory(blk)...)
+	}
+
+	p := &provisioner.K8sSA{
+		Type:    provisioner.TypeK8sSA.String(),
+		Name:    name,
+		Claims:  getClaims(ctx),
+		PubKeys: pubKeyBytes,
+	}
+
+	// Check for duplicates
+	if _, ok := provMap[p.GetID()]; !ok {
+		provMap[p.GetID()] = true
+	} else {
+		return nil, errors.Errorf("duplicated provisioner: CA config already contains a provisioner with ID=%s", p.GetID())
+	}
+
+	list = append(list, p)
+	return
+}
+
+// addSSHPOPProvisioner returns a provisioner list containing a SSHPOP provisioner.
+func addSSHPOPProvisioner(ctx *cli.Context, name string, provMap map[string]bool) (list provisioner.List, err error) {
+	ctx.Set("ssh", "true")
+	p := &provisioner.SSHPOP{
+		Type:   provisioner.TypeSSHPOP.String(),
+		Name:   name,
+		Claims: getClaims(ctx),
+	}
+
+	// Check for duplicates
+	if _, ok := provMap[p.GetID()]; !ok {
+		provMap[p.GetID()] = true
+	} else {
+		return nil, errors.Errorf("duplicated provisioner: CA config already contains a provisioner with ID=%s", p.GetID())
+	}
+
+	list = append(list, p)
+	return
+}
+
 func getClaims(ctx *cli.Context) *provisioner.Claims {
 	if ctx.Bool("ssh") {
 		enable := true
@@ -558,7 +756,13 @@ func parseProvisionerType(ctx *cli.Context) (provisioner.Type, error) {
 		return provisioner.TypeAzure, nil
 	case "acme":
 		return provisioner.TypeACME, nil
+	case "x5c":
+		return provisioner.TypeX5C, nil
+	case "sshpop":
+		return provisioner.TypeSSHPOP, nil
+	case "k8ssa":
+		return provisioner.TypeK8sSA, nil
 	default:
-		return 0, errs.InvalidFlagValue(ctx, "type", typ, "JWK, OIDC, AWS, Azure, GCP")
+		return 0, errs.InvalidFlagValue(ctx, "type", typ, "JWK, OIDC, AWS, Azure, GCP, ACME, X5C, SSHPOP, K8sSA")
 	}
 }

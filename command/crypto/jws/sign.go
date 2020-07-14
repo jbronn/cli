@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/smallstep/cli/flags"
 	"github.com/smallstep/cli/utils"
 
 	"github.com/pkg/errors"
@@ -20,8 +21,10 @@ func signCommand() cli.Command {
 		Action: cli.ActionFunc(signAction),
 		Usage:  "create a signed JWS data structure",
 		UsageText: `**step crypto jws sign** [- | <filename>]
-		[**--alg**=<algorithm>] [**--jku**=<jwk-url>] [**--jwk**] [**--typ**=<type>]
-		[**--cty=<content-type>] [**--key**=<path>] [**--jwks**=<jwks>] [**--kid**=<kid>]`,
+[**--alg**=<algorithm>] [**--jku**=<jwk-url>] [**--jwk**] [**--typ**=<type>]
+[**--cty**=<content-type>] [**--key**=<path>] [**--jwks**=<jwks>] [**--kid**=<kid>]
+[**--password-file**=<path>] [**--x5c-cert**=<path>] [**--x5c-key**=<path>]
+[**--x5t-cert**=<path>] [**--x5t-key**=<path>]`,
 		// others: x5u, x5c, x5t, x5t#S256, and crit
 		Description: `**step crypto jws sign** generates a signed JSON Web Signature (JWS) by
 computing a digital signature or message authentication code for an arbitrary
@@ -127,7 +130,7 @@ is ignored by JWS implementations; any processing of this parameter is
 performed by the JWS application. Use of <content-type> is optional.`,
 			},
 			cli.StringFlag{
-				Name: "key",
+				Name: "key, x5c-key, x5t-key",
 				Usage: `The <path> to the key with which to sign the JWS.
 JWSs can be signed using a private JWK (or a JWK encrypted as a JWE payload) or
 a PEM encoded private key (or a private key encrypted using the modes described
@@ -155,6 +158,9 @@ the **"kid"** member of one of the JWKs in the JWK Set.`,
 				Name:   "no-kid",
 				Hidden: true,
 			},
+			flags.PasswordFile,
+			flags.X5cCert,
+			flags.X5tCert,
 		},
 	}
 }
@@ -181,17 +187,55 @@ func signAction(ctx *cli.Context) error {
 	isSubtle := ctx.Bool("subtle")
 	alg := ctx.String("alg")
 
-	// Validate key, jwks and kid
+	x5cCertFile, x5cKeyFile := ctx.String("x5c-cert"), ctx.String("x5c-key")
+	x5tCertFile, x5tKeyFile := ctx.String("x5t-cert"), ctx.String("x5t-key")
 	key := ctx.String("key")
 	jwks := ctx.String("jwks")
 	kid := ctx.String("kid")
-	switch {
-	case key == "" && jwks == "":
-		return errs.RequiredOrFlag(ctx, "key", "jwks")
-	case key != "" && jwks != "":
-		return errs.MutuallyExclusiveFlags(ctx, "key", "jwks")
-	case jwks != "" && kid == "":
-		return errs.RequiredWithFlag(ctx, "kid", "jwks")
+	var isX5C bool
+	if len(x5cCertFile) > 0 {
+		if len(x5cKeyFile) == 0 {
+			return errs.RequiredWithOrFlag(ctx, "x5c-cert", "key", "x5c-key")
+		}
+		if len(x5tCertFile) > 0 {
+			return errs.MutuallyExclusiveFlags(ctx, "x5c-cert", "x5t-cert")
+		}
+		if ctx.IsSet("jwk") {
+			return errs.MutuallyExclusiveFlags(ctx, "x5c-cert", "jwk")
+		}
+		if len(jwks) > 0 {
+			return errs.MutuallyExclusiveFlags(ctx, "x5c-cert", "jwks")
+		}
+		isX5C = true
+	}
+
+	var isX5T bool
+	if len(x5tCertFile) > 0 {
+		if len(x5tKeyFile) == 0 {
+			return errs.RequiredWithOrFlag(ctx, "x5t-cert", "key", "x5t-key")
+		}
+		if len(x5cCertFile) > 0 {
+			return errs.MutuallyExclusiveFlags(ctx, "x5t-cert", "x5c-cert")
+		}
+		if ctx.IsSet("jwk") {
+			return errs.MutuallyExclusiveFlags(ctx, "x5t-cert", "jwk")
+		}
+		if len(jwks) > 0 {
+			return errs.MutuallyExclusiveFlags(ctx, "x5t-cert", "jwks")
+		}
+		isX5T = true
+	}
+
+	if !isX5C && !isX5T {
+		// Validate key, jwks and kid
+		switch {
+		case key == "" && jwks == "":
+			return errs.RequiredOrFlag(ctx, "key", "jwks")
+		case key != "" && jwks != "":
+			return errs.MutuallyExclusiveFlags(ctx, "key", "jwks")
+		case jwks != "" && kid == "":
+			return errs.RequiredWithFlag(ctx, "kid", "jwks")
+		}
 	}
 
 	// Add parse options
@@ -206,10 +250,17 @@ func signAction(ctx *cli.Context) error {
 	if isSubtle {
 		options = append(options, jose.WithSubtle(true))
 	}
+	if passwordFile := ctx.String("password-file"); len(passwordFile) != 0 {
+		options = append(options, jose.WithPasswordFile(passwordFile))
+	}
 
-	// Read key from --key or --jwks
+	// Read key from --key, --jwks, --x5c-key, or --x5t-key
 	var jwk *jose.JSONWebKey
 	switch {
+	case isX5T:
+		jwk, err = jose.ParseKey(x5tKeyFile, options...)
+	case isX5C:
+		jwk, err = jose.ParseKey(x5cKeyFile, options...)
 	case key != "":
 		jwk, err = jose.ParseKey(key, options...)
 	case jwks != "":
@@ -258,6 +309,20 @@ func signAction(ctx *cli.Context) error {
 	}
 	if ctx.Bool("jwk") {
 		so.WithHeader("jwk", jwk.Public())
+	}
+	if isX5C {
+		certStrs, err := jose.ValidateX5C(x5cCertFile, jwk.Key)
+		if err != nil {
+			return errors.Wrap(err, "error validating x5c certificate chain and key for use in x5c header")
+		}
+		so.WithHeader("x5c", certStrs)
+	}
+	if isX5T {
+		fingerprint, err := jose.ValidateX5T(x5tCertFile, jwk.Key)
+		if err != nil {
+			return errors.Wrap(err, "error validating x5t certificate and key for use in x5t header")
+		}
+		so.WithHeader("x5t", fingerprint)
 	}
 
 	signer, err := jose.NewSigner(jose.SigningKey{

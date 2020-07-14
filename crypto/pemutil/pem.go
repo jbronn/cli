@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
@@ -14,15 +15,12 @@ import (
 	"math/big"
 	"os"
 
-	"golang.org/x/crypto/ssh"
-
 	"github.com/pkg/errors"
 	"github.com/smallstep/cli/crypto/keys"
 	"github.com/smallstep/cli/errs"
-	stepx509 "github.com/smallstep/cli/pkg/x509"
 	"github.com/smallstep/cli/ui"
 	"github.com/smallstep/cli/utils"
-	"golang.org/x/crypto/ed25519"
+	"golang.org/x/crypto/ssh"
 )
 
 // DefaultEncCipher is the default algorithm used when encrypting sensitive
@@ -35,7 +33,8 @@ type context struct {
 	perm       os.FileMode
 	password   []byte
 	pkcs8      bool
-	stepCrypto bool
+	openSSH    bool
+	comment    string
 	firstBlock bool
 }
 
@@ -59,6 +58,14 @@ func (c *context) apply(opts []Options) error {
 
 // Options is the type to add attributes to the context.
 type Options func(o *context) error
+
+// withContext replaces the context with the given one.
+func withContext(c *context) Options {
+	return func(ctx *context) error {
+		*ctx = *c
+		return nil
+	}
+}
 
 // WithFilename is a method that adds the given filename to the context.
 func WithFilename(name string) Options {
@@ -105,7 +112,7 @@ func WithPasswordFile(filename string) Options {
 // WithPasswordPrompt ask the user for a password and adds it to the context.
 func WithPasswordPrompt(prompt string) Options {
 	return func(ctx *context) error {
-		b, err := ui.PromptPassword(prompt)
+		b, err := ui.PromptPassword(prompt, ui.WithValidateNotEmpty())
 		if err != nil {
 			return err
 		}
@@ -124,11 +131,20 @@ func WithPKCS8(v bool) Options {
 	}
 }
 
-// WithStepCrypto returns cryptographic primitives of the modified step Crypto
-// library.
-func WithStepCrypto() Options {
+// WithOpenSSH is an option used in the Serialize method to use OpenSSH encoding
+// form on the private keys. With v set to false default form will be used.
+func WithOpenSSH(v bool) Options {
 	return func(ctx *context) error {
-		ctx.stepCrypto = true
+		ctx.openSSH = v
+		return nil
+	}
+}
+
+// WithComment is an option used in the Serialize method to add a comment in the
+// OpenSSH private keys. WithOpenSSH must be set to true too.
+func WithComment(comment string) Options {
+	return func(ctx *context) error {
+		ctx.comment = comment
 		return nil
 	}
 }
@@ -212,34 +228,6 @@ func ReadCertificateBundle(filename string) ([]*x509.Certificate, error) {
 	return []*x509.Certificate{crt}, nil
 }
 
-// ReadStepCertificate returns a *x509.Certificate from the given filename. It
-// supports certificates formats PEM and DER.
-func ReadStepCertificate(filename string) (*stepx509.Certificate, error) {
-	b, err := ioutil.ReadFile(filename)
-	if err != nil {
-		return nil, errs.FileError(err, filename)
-	}
-
-	// PEM format
-	if bytes.HasPrefix(b, []byte("-----BEGIN ")) {
-		var crt interface{}
-		crt, err = Read(filename, []Options{WithStepCrypto()}...)
-		if err != nil {
-			return nil, err
-		}
-		switch crt := crt.(type) {
-		case *stepx509.Certificate:
-			return crt, nil
-		default:
-			return nil, errors.Errorf("error decoding PEM: file '%s' does not contain a certificate", filename)
-		}
-	}
-
-	// DER format (binary)
-	crt, err := stepx509.ParseCertificate(b)
-	return crt, errors.Wrapf(err, "error parsing %s", filename)
-}
-
 // Parse returns the key or certificate PEM-encoded in the given bytes.
 func Parse(b []byte, opts ...Options) (interface{}, error) {
 	// Populate options
@@ -251,7 +239,7 @@ func Parse(b []byte, opts ...Options) (interface{}, error) {
 	block, rest := pem.Decode(b)
 	switch {
 	case block == nil:
-		return nil, errors.Errorf("error decoding %s: is not a valid PEM encoded block", ctx.filename)
+		return nil, errors.Errorf("error decoding %s: not a valid PEM encoded block", ctx.filename)
 	case len(rest) > 0 && !ctx.firstBlock:
 		return nil, errors.Errorf("error decoding %s: contains more than one PEM endoded block", ctx.filename)
 	}
@@ -286,21 +274,16 @@ func Parse(b []byte, opts ...Options) (interface{}, error) {
 	case "EC PRIVATE KEY":
 		priv, err := x509.ParseECPrivateKey(block.Bytes)
 		return priv, errors.Wrapf(err, "error parsing %s", ctx.filename)
-	case "PRIVATE KEY", "OPENSSH PRIVATE KEY", "ENCRYPTED PRIVATE KEY":
+	case "PRIVATE KEY", "ENCRYPTED PRIVATE KEY":
 		priv, err := ParsePKCS8PrivateKey(block.Bytes)
 		return priv, errors.Wrapf(err, "error parsing %s", ctx.filename)
+	case "OPENSSH PRIVATE KEY":
+		priv, err := ParseOpenSSHPrivateKey(block.Bytes, withContext(ctx))
+		return priv, errors.Wrapf(err, "error parsing %s", ctx.filename)
 	case "CERTIFICATE":
-		if ctx.stepCrypto {
-			crt, err := stepx509.ParseCertificate(block.Bytes)
-			return crt, errors.Wrapf(err, "error parsing %s", ctx.filename)
-		}
 		crt, err := x509.ParseCertificate(block.Bytes)
 		return crt, errors.Wrapf(err, "error parsing %s", ctx.filename)
 	case "CERTIFICATE REQUEST", "NEW CERTIFICATE REQUEST":
-		if ctx.stepCrypto {
-			csr, err := stepx509.ParseCertificateRequest(block.Bytes)
-			return csr, errors.Wrapf(err, "error parsing %s", ctx.filename)
-		}
 		csr, err := x509.ParseCertificateRequest(block.Bytes)
 		return csr, errors.Wrapf(err, "error parsing %s", ctx.filename)
 	default:
@@ -356,7 +339,8 @@ func Serialize(in interface{}, opts ...Options) (*pem.Block, error) {
 			Bytes: b,
 		}
 	case *rsa.PrivateKey:
-		if ctx.pkcs8 {
+		switch {
+		case ctx.pkcs8:
 			b, err := MarshalPKCS8PrivateKey(k)
 			if err != nil {
 				return nil, err
@@ -365,14 +349,17 @@ func Serialize(in interface{}, opts ...Options) (*pem.Block, error) {
 				Type:  "PRIVATE KEY",
 				Bytes: b,
 			}
-		} else {
+		case ctx.openSSH:
+			return SerializeOpenSSHPrivateKey(k, withContext(ctx))
+		default:
 			p = &pem.Block{
 				Type:  "RSA PRIVATE KEY",
 				Bytes: x509.MarshalPKCS1PrivateKey(k),
 			}
 		}
 	case *ecdsa.PrivateKey:
-		if ctx.pkcs8 {
+		switch {
+		case ctx.pkcs8:
 			b, err := MarshalPKCS8PrivateKey(k)
 			if err != nil {
 				return nil, err
@@ -381,7 +368,9 @@ func Serialize(in interface{}, opts ...Options) (*pem.Block, error) {
 				Type:  "PRIVATE KEY",
 				Bytes: b,
 			}
-		} else {
+		case ctx.openSSH:
+			return SerializeOpenSSHPrivateKey(k, withContext(ctx))
+		default:
 			b, err := x509.MarshalECPrivateKey(k)
 			if err != nil {
 				return nil, errors.Wrap(err, "failed to marshal private key")
@@ -391,32 +380,27 @@ func Serialize(in interface{}, opts ...Options) (*pem.Block, error) {
 				Bytes: b,
 			}
 		}
-	case ed25519.PrivateKey: // force the use of pkcs8
-		ctx.pkcs8 = true
-		b, err := MarshalPKCS8PrivateKey(k)
-		if err != nil {
-			return nil, err
-		}
-		p = &pem.Block{
-			Type:  "PRIVATE KEY",
-			Bytes: b,
+	case ed25519.PrivateKey:
+		switch {
+		case !ctx.pkcs8 && ctx.openSSH:
+			return SerializeOpenSSHPrivateKey(k, withContext(ctx))
+		default: // Ed25519 keys will use pkcs8 by default
+			ctx.pkcs8 = true
+			b, err := MarshalPKCS8PrivateKey(k)
+			if err != nil {
+				return nil, err
+			}
+			p = &pem.Block{
+				Type:  "PRIVATE KEY",
+				Bytes: b,
+			}
 		}
 	case *x509.Certificate:
 		p = &pem.Block{
 			Type:  "CERTIFICATE",
 			Bytes: k.Raw,
 		}
-	case *stepx509.Certificate:
-		p = &pem.Block{
-			Type:  "CERTIFICATE",
-			Bytes: k.Raw,
-		}
 	case *x509.CertificateRequest:
-		p = &pem.Block{
-			Type:  "CERTIFICATE REQUEST",
-			Bytes: k.Raw,
-		}
-	case *stepx509.CertificateRequest:
 		p = &pem.Block{
 			Type:  "CERTIFICATE REQUEST",
 			Bytes: k.Raw,
@@ -480,6 +464,10 @@ func ParseSSH(b []byte) (interface{}, error) {
 	key, _, _, _, err := ssh.ParseAuthorizedKey(b)
 	if err != nil {
 		return nil, errors.Wrap(err, "error parsing OpenSSH key")
+	}
+
+	if cert, ok := key.(*ssh.Certificate); ok {
+		key = cert.Key
 	}
 
 	switch key.Type() {

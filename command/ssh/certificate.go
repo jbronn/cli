@@ -2,68 +2,32 @@ package ssh
 
 import (
 	"bytes"
-	"net"
-	"os"
+	"crypto"
+	"crypto/rand"
+	"crypto/x509"
+	"io/ioutil"
+	"net/url"
 	"strings"
-	"time"
 
+	"github.com/google/uuid"
 	"github.com/pkg/errors"
 	"github.com/smallstep/certificates/api"
 	"github.com/smallstep/certificates/authority/provisioner"
+	"github.com/smallstep/certificates/ca"
+	"github.com/smallstep/certificates/ca/identity"
 	"github.com/smallstep/cli/command"
 	"github.com/smallstep/cli/crypto/keys"
 	"github.com/smallstep/cli/crypto/pemutil"
+	"github.com/smallstep/cli/crypto/sshutil"
 	"github.com/smallstep/cli/errs"
 	"github.com/smallstep/cli/flags"
+	"github.com/smallstep/cli/jose"
 	"github.com/smallstep/cli/ui"
 	"github.com/smallstep/cli/utils"
 	"github.com/smallstep/cli/utils/cautils"
 	"github.com/urfave/cli"
+	"golang.org/x/crypto/blake2b"
 	"golang.org/x/crypto/ssh"
-	"golang.org/x/crypto/ssh/agent"
-)
-
-var (
-	sshPrincipalFlag = cli.StringSliceFlag{
-		Name: "principal,n",
-		Usage: `Add the principals (users or hosts) that the token is authorized to
-		request. The signing request using this token won't be able to add
-		extra names. Use the '--principal' flag multiple times to configure
-		multiple ones. The '--principal' flag and the '--token' flag are
-		mutually exlusive.`,
-	}
-
-	sshHostFlag = cli.BoolFlag{
-		Name:  "host",
-		Usage: `Create a host certificate instead of a user certificate.`,
-	}
-
-	sshSignFlag = cli.BoolFlag{
-		Name:  "sign",
-		Usage: `Sign the public key passed as an argument instead of creating one.`,
-	}
-
-	sshPasswordFileFlag = cli.StringFlag{
-		Name:  "password-file",
-		Usage: `The path to the <file> containing the password to encrypt the private key.`,
-	}
-
-	sshProvisionerPasswordFlag = cli.StringFlag{
-		Name: "provisioner-password-file",
-		Usage: `The path to the <file> containing the password to decrypt the one-time token
-		generating key.`,
-	}
-
-	sshAddUserFlag = cli.BoolFlag{
-		Name:  "add-user",
-		Usage: `Create a user provisioner certificate used to create a new user.`,
-	}
-
-	sshPrivateKeyFlag = cli.StringFlag{
-		Name: "private-key",
-		Usage: `When signing an existing public key, use this flag to specify the corresponding
-private key so that the pair can be added to an SSH Agent.`,
-	}
 )
 
 func certificateCommand() cli.Command {
@@ -72,11 +36,12 @@ func certificateCommand() cli.Command {
 		Action: command.ActionFunc(certificateAction),
 		Usage:  "sign a SSH certificate using the the SSH CA",
 		UsageText: `**step ssh certificate** <key-id> <key-file>
-[**--host**] [**--sign**] [**--principal**=<string>] [**--password-file**=<path>]
+[**--host**] [--**host-id**] [**--sign**] [**--principal**=<string>] [**--password-file**=<path>]
 [**--provisioner-password-file**=<path>] [**--add-user**]
 [**--not-before**=<time|duration>] [**--not-after**=<time|duration>]
 [**--token**=<token>] [**--issuer**=<name>] [**--ca-url**=<uri>]
-[**--root**=<file>] [**--no-password**] [**--insecure**] [**--force**]`,
+[**--root**=<path>] [**--no-password**] [**--insecure**] [**--force**]
+[**--x5c-cert**=<path>] [**--x5c-key**=<path>] [**--k8ssa-token-path=<path>]`,
 		Description: `**step ssh certificate** command generates an SSH key pair and creates a
 certificate using [step certificates](https://github.com/smallstep/certificates).
 
@@ -156,6 +121,19 @@ $ step ssh certificate --host --sign \
 	internal.example.com ssh_host_ecdsa_key.pub
 '''
 
+Sign an SSH public key and generate a host certificate with a custom uuid:
+'''
+$ step ssh certificate --host --host-id 00000000-0000-0000-0000-000000000000 \
+	--sign internal.example.com ssh_host_ecdsa_key.pub
+'''
+
+Sign an SSH public key and generate a host certificate with a uuid derived
+from '/etc/machine-id':
+'''
+$ step ssh certificate --host --host-id machine --sign \
+	internal.example.com ssh_host_ecdsa_key.pub
+'''
+
 Generate an ssh certificate with custom principals from an existing key pair and
 add the certificate to the ssh agent:
 '''
@@ -181,11 +159,15 @@ $ step ssh certificate --token $TOKEN mariano@work id_ecdsa
 			flags.Token,
 			sshAddUserFlag,
 			sshHostFlag,
+			sshHostIDFlag,
 			sshPasswordFileFlag,
 			sshPrincipalFlag,
 			sshPrivateKeyFlag,
 			sshProvisionerPasswordFlag,
 			sshSignFlag,
+			flags.X5cCert,
+			flags.X5cKey,
+			flags.K8sSATokenPathFlag,
 		},
 	}
 }
@@ -206,6 +188,7 @@ func certificateAction(ctx *cli.Context) error {
 	// Flags
 	token := ctx.String("token")
 	isHost := ctx.Bool("host")
+	hostID := ctx.String("host-id")
 	isSign := ctx.Bool("sign")
 	isAddUser := ctx.Bool("add-user")
 	principals := ctx.StringSlice("principal")
@@ -233,6 +216,8 @@ func certificateAction(ctx *cli.Context) error {
 		return errs.IncompatibleFlagWithFlag(ctx, "token", "provisioner-password-file")
 	case isHost && isAddUser:
 		return errs.IncompatibleFlagWithFlag(ctx, "host", "add-user")
+	case !isHost && hostID != "":
+		return errs.RequiredWithFlag(ctx, sshHostIDFlag.Name, sshHostFlag.Name)
 	case isAddUser && len(principals) > 1:
 		return errors.New("flag '--add-user' is incompatible with more than one principal")
 	}
@@ -243,11 +228,17 @@ func certificateAction(ctx *cli.Context) error {
 		crtFile = baseName + "-cert.pub"
 	}
 
-	var certType string
+	var (
+		certType string
+		tokType  int
+	)
+
 	if isHost {
 		certType = provisioner.SSHHostCert
+		tokType = cautils.SSHHostSignType
 	} else {
 		certType = provisioner.SSHUserCert
+		tokType = cautils.SSHUserSignType
 	}
 
 	// By default use the first part of the subject as a principal
@@ -264,14 +255,85 @@ func certificateAction(ctx *cli.Context) error {
 		return err
 	}
 	if len(token) == 0 {
-		if token, err = flow.GenerateSSHToken(ctx, subject, certType, principals, validAfter, validBefore); err != nil {
+		if token, err = flow.GenerateSSHToken(ctx, subject, tokType, principals, validAfter, validBefore); err != nil {
 			return err
 		}
 	}
 
-	caClient, err := flow.GetClient(ctx, subject, token)
+	caClient, err := flow.GetClient(ctx, token)
 	if err != nil {
 		return err
+	}
+
+	version, err := caClient.Version()
+	if err != nil {
+		return err
+	}
+
+	// Generate identity certificate (x509) if necessary
+	var identityCSR api.CertificateRequest
+	var identityKey crypto.PrivateKey
+	if version.RequireClientAuthentication {
+		csr, key, err := ca.CreateIdentityRequest(subject)
+		if err != nil {
+			return err
+		}
+
+		// All host identity certs need a URI SAN to work with our ssh API.
+		if isHost {
+			var u = uuid.Nil
+			switch hostID {
+			case "":
+				// If there is an old identity cert lying around, by default use the host ID so that running
+				// this command twice doesn't clobber your old host ID.
+				u, err = readExistingUUID()
+				if err != nil {
+					u, err = uuid.NewRandom()
+					if err != nil {
+						return errs.Wrap(err, "Unable to generate a host-id.")
+					}
+				}
+			case "machine":
+				u, err = deriveMachineID()
+				if err != nil {
+					return errs.Wrap(err, "Unable to derive a host-id. Make sure /etc/machine-id exists.")
+				}
+			default:
+				u, err = uuid.Parse(hostID)
+				if err != nil {
+					return errs.InvalidFlagValue(ctx, sshHostIDFlag.Name, hostID, "[ machine | <UUID> ]")
+				}
+			}
+			uri, err := url.Parse(u.URN())
+			if err != nil {
+				return errs.Wrap(err, "failed parsing uuid urn")
+			}
+
+			template := &x509.CertificateRequest{
+				Subject:        csr.Subject,
+				DNSNames:       csr.DNSNames,
+				IPAddresses:    csr.IPAddresses,
+				EmailAddresses: csr.EmailAddresses,
+				// Prepend the generated uri. There is code that expects the
+				// uuid URI to be the first one.
+				URIs: append([]*url.URL{uri}, csr.URIs...),
+			}
+			csrBytes, err := x509.CreateCertificateRequest(rand.Reader, template, key)
+			if err != nil {
+				return errs.Wrap(err, "failed creating certificate request")
+			}
+			newCSR, err := x509.ParseCertificateRequest(csrBytes)
+			if err != nil {
+				return errs.Wrap(err, "failed parsing certificate request bytes")
+			}
+			if err := newCSR.CheckSignature(); err != nil {
+				return errs.Wrap(err, "failed signature check on new csr")
+			}
+			csr.CertificateRequest = newCSR
+		}
+
+		identityCSR = *csr
+		identityKey = key
 	}
 
 	var sshPub ssh.PublicKey
@@ -321,14 +383,33 @@ func certificateAction(ctx *cli.Context) error {
 		sshAuPubBytes = sshAuPub.Marshal()
 	}
 
-	resp, err := caClient.SignSSH(&api.SignSSHRequest{
+	// NOTE: For OIDC token the principals should be completely empty unless
+	// defined explicitly on the command line using the `--principal` flag.
+	// The OIDC provisioner is responsible for setting default principals by
+	// using an identity function.
+	j, err := jose.ParseSigned(token)
+	if err != nil {
+		return errors.Wrap(err, "error parsing token")
+	}
+	var payload oidcPayload
+	if err := j.UnsafeClaimsWithoutVerification(&payload); err != nil {
+		return errors.Wrap(err, "err parsing token claims")
+	}
+	// If it's an OIDC token and and no principals were explicitly set ...
+	if len(payload.Email) > 0 && !ctx.IsSet("principal") {
+		principals = []string{}
+	}
+
+	resp, err := caClient.SSHSign(&api.SSHSignRequest{
 		PublicKey:        sshPub.Marshal(),
 		OTT:              token,
 		Principals:       principals,
 		CertType:         certType,
+		KeyID:            subject,
 		ValidAfter:       validAfter,
 		ValidBefore:      validBefore,
 		AddUserPublicKey: sshAuPubBytes,
+		IdentityCSR:      identityCSR,
 	})
 	if err != nil {
 		return err
@@ -338,6 +419,7 @@ func certificateAction(ctx *cli.Context) error {
 	if !isSign {
 		// Private key (with password unless --no-password --insecure)
 		opts := []pemutil.Options{
+			pemutil.WithOpenSSH(true),
 			pemutil.ToFile(keyFile, 0600),
 		}
 		switch {
@@ -363,15 +445,22 @@ func certificateAction(ctx *cli.Context) error {
 	}
 
 	// Write Add User keys and certs
-	if isAddUser {
+	if isAddUser && resp.AddUserCertificate != nil {
 		id := provisioner.SanitizeSSHUserPrincipal(subject) + "-provisioner"
-		if _, err := pemutil.Serialize(auPriv, pemutil.ToFile(baseName+"-provisioner", 0600)); err != nil {
+		if _, err := pemutil.Serialize(auPriv, pemutil.WithOpenSSH(true), pemutil.ToFile(baseName+"-provisioner", 0600)); err != nil {
 			return err
 		}
 		if err := utils.WriteFile(baseName+"-provisioner.pub", marshalPublicKey(sshAuPub, id), 0644); err != nil {
 			return err
 		}
 		if err := utils.WriteFile(baseName+"-provisioner-cert.pub", marshalPublicKey(resp.AddUserCertificate, id), 0644); err != nil {
+			return err
+		}
+	}
+
+	// Write x509 identity certificate
+	if version.RequireClientAuthentication {
+		if err := ca.WriteDefaultIdentity(resp.IdentityCertificate, identityKey); err != nil {
 			return err
 		}
 	}
@@ -383,18 +472,23 @@ func certificateAction(ctx *cli.Context) error {
 	ui.PrintSelected("Certificate", crtFile)
 
 	// Attempt to add key to agent if private key defined.
-	if priv != nil {
-		if err := sshAddKeyToAgent(subject, resp.Certificate.Certificate, priv); err != nil {
+	if priv != nil && certType == provisioner.SSHUserCert {
+		if agent, err := sshutil.DialAgent(); err != nil {
 			ui.Printf(`{{ "%s" | red }} {{ "SSH Agent:" | bold }} %v`+"\n", ui.IconBad, err)
 		} else {
-			ui.PrintSelected("SSH Agent", "yes")
+			defer agent.Close()
+			if err := agent.AddCertificate(subject, resp.Certificate.Certificate, priv); err != nil {
+				ui.Printf(`{{ "%s" | red }} {{ "SSH Agent:" | bold }} %v`+"\n", ui.IconBad, err)
+			} else {
+				ui.PrintSelected("SSH Agent", "yes")
+			}
 		}
 	}
 
-	if isAddUser {
-		ui.PrintSelected("Provisioner Private Key", baseName+"-provisioner")
-		ui.PrintSelected("Provisioner Public Key", baseName+"-provisioner.pub")
-		ui.PrintSelected("Provisioner Certificate", baseName+"-provisioner-cert.pub")
+	if isAddUser && resp.AddUserCertificate != nil {
+		ui.PrintSelected("Add User Private Key", baseName+"-provisioner")
+		ui.PrintSelected("Add User Public Key", baseName+"-provisioner.pub")
+		ui.PrintSelected("Add User Certificate", baseName+"-provisioner-cert.pub")
 	}
 
 	return nil
@@ -408,29 +502,58 @@ func marshalPublicKey(key ssh.PublicKey, subject string) []byte {
 	return append(b, []byte(" "+subject+"\n")...)
 }
 
-func sshAddKeyToAgent(subject string, cert *ssh.Certificate, priv interface{}) error {
-	socket := os.Getenv("SSH_AUTH_SOCK")
-	conn, err := net.Dial("unix", socket)
+// oidcPayload is a payload used to determine if a JWT is an OIDC token.
+type oidcPayload struct {
+	jose.Claims
+	Email string `json:"email"` // OIDC indicator
+}
+
+func deriveMachineID() (uuid.UUID, error) {
+	// use /etc/machine-id
+	machineID, err := ioutil.ReadFile("/etc/machine-id")
 	if err != nil {
-		return errors.Wrap(err, "error connecting with ssh-agent")
+		return uuid.Nil, err
 	}
-	client := agent.NewClient(conn)
-	var (
-		lifetime uint64
-		now      = uint64(time.Now().Unix())
-	)
-	if cert.ValidBefore == ssh.CertTimeInfinity {
-		// 0 indicates that the certificate should never expire from the agent.
-		lifetime = 0
-	} else if cert.ValidBefore <= now {
-		return errors.New("error adding certificate to ssh agent - certificate is already expired")
-	} else {
-		lifetime = cert.ValidBefore - now
+
+	// 16 bytes, not secret
+	key := []byte("man moon machine")
+	mac, err := blake2b.New(16, key)
+	if err != nil {
+		return uuid.Nil, err
 	}
-	return errors.Wrap(client.Add(agent.AddedKey{
-		PrivateKey:   priv,
-		Certificate:  cert,
-		Comment:      subject,
-		LifetimeSecs: uint32(lifetime),
-	}), "error adding key to agent")
+	mac.Write(machineID)
+	machineHash := mac.Sum(nil)
+	var u uuid.UUID
+	copy(u[:], machineHash)
+	// Make it a v4 uuid (taken from uuid.NewRandom):
+	u[6] = (u[6] & 0x0f) | 0x40 // Version 4
+	u[8] = (u[8] & 0x3f) | 0x80 // Variant is 10
+
+	return u, nil
+}
+
+func readExistingUUID() (uuid.UUID, error) {
+	id, err := identity.LoadDefaultIdentity()
+	if err != nil {
+		return uuid.Nil, errs.Wrap(err, "error loading default identity")
+	}
+	if err := id.Validate(); err != nil {
+		return uuid.Nil, errs.Wrap(err, "error validating identity file")
+	}
+	certs, err := pemutil.ReadCertificateBundle(id.Certificate)
+	if err != nil {
+		return uuid.Nil, errs.Wrap(err, "error parsing default identity")
+	}
+	leaf := certs[0]
+	if len(leaf.URIs) < 1 {
+		return uuid.Nil, errors.New("incompatible certificate: missing host uuid")
+	}
+	uri := leaf.URIs[0]
+	// TODO: add a smallstep namespace at some point
+	//       so we can actually find our host id
+	u, err := uuid.Parse(uri.String())
+	if err != nil {
+		return uuid.Nil, errs.Wrap(err, "error parsing host-id")
+	}
+	return u, nil
 }
