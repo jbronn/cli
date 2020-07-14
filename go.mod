@@ -30,6 +30,6 @@ require (
 )
 
 replace (
-     github.com/smallstep/certificates v0.14.6 => github.com/jbronn/certificates v0.14.6
+     github.com/smallstep/certificates => github.com/jbronn/certificates hjsj
 )
 //replace github.com/smallstep/certinfo => ../certinfo
