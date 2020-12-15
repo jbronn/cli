@@ -1,12 +1,18 @@
 package flags
 
 import (
+	"encoding/json"
+	"fmt"
+	"net/url"
 	"path/filepath"
+	"strings"
 	"time"
 
+	"github.com/pkg/errors"
 	"github.com/smallstep/certificates/api"
 	"github.com/smallstep/cli/config"
 	"github.com/smallstep/cli/errs"
+	"github.com/smallstep/cli/utils"
 	"github.com/urfave/cli"
 )
 
@@ -172,7 +178,7 @@ generating key.`,
 		Name: "offline",
 		Usage: `Creates a certificate without contacting the certificate authority. Offline mode
 uses the configuration, certificates, and keys created with **step ca init**,
-but can accept a different configuration file using '--ca-config>' flag.`,
+but can accept a different configuration file using **--ca-config** flag.`,
 	}
 
 	// CaConfig is a cli.Flag used to pass the CA configuration file.
@@ -226,17 +232,17 @@ the 'x5t' header.`,
 be stored in the 'sshpop' header.`,
 	}
 
-	// Team is a cli.Flag used to pass the team name.
+	// Team is a cli.Flag used to pass the team ID.
 	Team = cli.StringFlag{
 		Name:  "team",
-		Usage: "The team <name> used to bootstrap the environment.",
+		Usage: "The team <ID> used to bootstrap the environment.",
 	}
 
 	// TeamURL is a cli.Flag used to pass the team URL.
 	TeamURL = cli.StringFlag{
 		Name: "team-url",
 		Usage: `The <url> step queries to retrieve initial team configuration. Only used with
-the --team option. If the url contains "\<\>" placeholders, they are replaced with the team name.`,
+the **--team** option. If the url contains <\<\>> placeholders, they are replaced with the team ID.`,
 	}
 
 	// RedirectURL is a cli.Flag used to pass the OAuth redirect URL.
@@ -250,6 +256,26 @@ the --team option. If the url contains "\<\>" placeholders, they are replaced wi
 	ServerName = cli.StringFlag{
 		Name:  "servername",
 		Usage: `TLS Server Name Indication that should be sent to request a specific certificate from the server.`,
+	}
+
+	// TemplateSet is a cli.Flag used to send key-value pairs to the ca.
+	TemplateSet = cli.StringSliceFlag{
+		Name:  "set",
+		Usage: "The <key=value> pair with template data variables to send to the CA. Use the **--set** flag multiple times to add multiple variables.",
+	}
+
+	// TemplateSetFile is a cli.Flag used to send a JSON file to the CA.
+	TemplateSetFile = cli.StringFlag{
+		Name:  "set-file",
+		Usage: "The <path> of a JSON file with the template data to send to the CA.",
+	}
+
+	// Identity is a cli.Flag used to be able to define the identity argument in
+	// defaults.json.
+	Identity = cli.StringFlag{
+		Name: "identity",
+		Usage: `The certificate identity. It is usually passed as a positional argument, but a
+flag exists so it can be configured in $STEPPATH/config/defaults.json.`,
 	}
 )
 
@@ -283,4 +309,82 @@ func ParseTimeDuration(ctx *cli.Context) (notBefore api.TimeDuration, notAfter a
 		return zero, zero, errs.InvalidFlagValue(ctx, "not-after", ctx.String("not-after"), "")
 	}
 	return
+}
+
+// ParseTemplateData parses the set and and set-file flags and returns a json
+// message to be used in certificate templates.
+func ParseTemplateData(ctx *cli.Context) (json.RawMessage, error) {
+	data := make(map[string]interface{})
+	if path := ctx.String("set-file"); path != "" {
+		b, err := utils.ReadFile(path)
+		if err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(b, &data); err != nil {
+			return nil, errors.Wrapf(err, "error unmarshaling %s", path)
+		}
+	}
+
+	keyValues := ctx.StringSlice("set")
+	for _, s := range keyValues {
+		i := strings.Index(s, "=")
+		if i == -1 {
+			return nil, errs.InvalidFlagValue(ctx, "set", s, "")
+		}
+		key, value := s[:i], s[i+1:]
+
+		// If the value is not json, use the raw string.
+		var v interface{}
+		if err := json.Unmarshal([]byte(value), &v); err == nil {
+			data[key] = v
+		} else {
+			data[key] = value
+		}
+	}
+
+	if len(data) == 0 {
+		return nil, nil
+	}
+
+	return json.Marshal(data)
+}
+
+// ParseCaURL gets and parses the ca-url from the command context.
+//  - Require non-empty value.
+//  - Prepend an 'https' scheme if the URL does not have a scheme.
+//  - Error if the URL scheme is not implicitly or explicitly 'https'.
+func ParseCaURL(ctx *cli.Context) (string, error) {
+	caURL := ctx.String("ca-url")
+	if len(caURL) == 0 {
+		return "", errs.RequiredFlag(ctx, "ca-url")
+	}
+
+	return parseCaURL(ctx, caURL)
+}
+
+// ParseCaURLIfExists gets and parses the ca-url from the command context, if
+// one is present.
+//  - Allow empty value.
+//  - Prepend an 'https' scheme if the URL does not have a scheme.
+//  - Error if the URL scheme is not implicitly or explicitly 'https'.
+func ParseCaURLIfExists(ctx *cli.Context) (string, error) {
+	caURL := ctx.String("ca-url")
+	if len(caURL) == 0 {
+		return "", nil
+	}
+	return parseCaURL(ctx, caURL)
+}
+
+func parseCaURL(ctx *cli.Context, caURL string) (string, error) {
+	if !strings.Contains(caURL, "://") {
+		caURL = "https://" + caURL
+	}
+	u, err := url.Parse(caURL)
+	if err != nil {
+		return "", errs.InvalidFlagValueMsg(ctx, "ca-url", caURL, "invalid URL")
+	}
+	if u.Scheme != "https" {
+		return "", errs.InvalidFlagValueMsg(ctx, "ca-url", caURL, "must have https scheme")
+	}
+	return fmt.Sprintf("%s://%s", u.Scheme, u.Host), nil
 }

@@ -7,6 +7,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/smallstep/certificates/pki"
 	"github.com/smallstep/cli/errs"
+	"github.com/smallstep/cli/flags"
 	"github.com/urfave/cli"
 )
 
@@ -15,8 +16,8 @@ func listCommand() cli.Command {
 		Name:   "list",
 		Action: cli.ActionFunc(listAction),
 		Usage:  "list provisioners configured in the CA",
-		UsageText: `**step ca provisioner list** [**--ca-url**=<uri>]
-[**--root**=<file>]`,
+		UsageText: `**step ca provisioner list** 
+[**--ca-url**=<uri>] [**--root**=<file>]`,
 		Flags: []cli.Flag{
 			cli.StringFlag{
 				Name:  "ca-url",
@@ -45,9 +46,9 @@ func listAction(ctx *cli.Context) error {
 	}
 
 	root := ctx.String("root")
-	caURL := ctx.String("ca-url")
-	if len(caURL) == 0 {
-		return errs.RequiredFlag(ctx, "ca-url")
+	caURL, err := flags.ParseCaURL(ctx)
+	if err != nil {
+		return err
 	}
 
 	provisioners, err := pki.GetProvisioners(caURL, root)

@@ -28,10 +28,10 @@ func configCommand() cli.Command {
 		Action: command.ActionFunc(configAction),
 		Usage:  "configures ssh to be used with certificates",
 		UsageText: `**step ssh config**
-		[**--team**=name] [**--host**] [**--set**=<key=value>]
-		[**--dry-run**] [**--roots**] [**--federation**]
-		[**--force**] [**--ca-url**=<uri>] [**--root**=<file>]
-		[**--offline**] [**--ca-config**=<path>] [**--team-url**=<url>]`,
+[**--team**=<name>] [**--host**] [**--set**=<key=value>] [**--set-file**=<path>]
+[**--dry-run**] [**--roots**] [**--federation**]
+[**--force**] [**--ca-url**=<uri>] [**--root**=<file>]
+[**--offline**] [**--ca-config**=<path>] [**--team-url**=<url>]`,
 		Description: `**step ssh config** configures SSH to be used with certificates. It also supports
 flags to inspect the root certificates used to sign the certificates.
 
@@ -85,6 +85,7 @@ user or host certificates`,
 				Usage: `The <key=value> used as a variable in the templates. Use the flag multiple
 times to set multiple variables.`,
 			},
+			flags.TemplateSetFile,
 			flags.DryRun,
 			flags.CaURL,
 			flags.Root,

@@ -25,10 +25,11 @@ func loginCommand() cli.Command {
 		Action: command.ActionFunc(loginAction),
 		Usage:  "adds a SSH certificate into the authentication agent",
 		UsageText: `**step ssh login** <identity>
-		[**--token**=<token>] [**--provisioner**=<name>] [**--provisioner-password-file**=<file>]
-		[**--not-before**=<time|duration>] [**--not-after**=<time|duration>]
-		[**--force**] [**--ca-url**=<uri>] [**--root**=<file>]
-		[**--offline**] [**--ca-config**=<path>]`,
+[**--token**=<token>] [**--provisioner**=<name>] [**--provisioner-password-file**=<file>]
+[**--not-before**=<time|duration>] [**--not-after**=<time|duration>]
+[**--set**=<key=value>] [**--set-file**=<path>]
+[**--force**] [**--ca-url**=<uri>] [**--root**=<file>]
+[**--offline**] [**--ca-config**=<path>]`,
 		Description: `**step ssh login** generates a new SSH key pair and send a request to [step
 certificates](https://github.com/smallstep/certificates) to sign a user
 certificate. This certificate will be automatically added to the SSH agent.
@@ -57,10 +58,13 @@ $ step ssh login --not-after 1h joe@smallstep.com
 		Flags: []cli.Flag{
 			flags.Token,
 			sshAddUserFlag,
+			flags.Identity,
 			flags.Provisioner,
 			flags.ProvisionerPasswordFileWithAlias,
 			flags.NotBefore,
 			flags.NotAfter,
+			flags.TemplateSet,
+			flags.TemplateSetFile,
 			flags.CaURL,
 			flags.Root,
 			flags.Offline,
@@ -71,20 +75,28 @@ $ step ssh login --not-after 1h joe@smallstep.com
 }
 
 func loginAction(ctx *cli.Context) error {
-	if err := errs.NumberOfArguments(ctx, 1); err != nil {
+	if err := errs.MinMaxNumberOfArguments(ctx, 0, 1); err != nil {
 		return err
 	}
 
 	// Arguments
 	subject := ctx.Args().First()
-	user := provisioner.SanitizeSSHUserPrincipal(subject)
-	principals := []string{user}
+	if subject == "" {
+		if subject = ctx.String("identity"); subject == "" {
+			return errs.TooFewArguments(ctx)
+		}
+	}
+	principals := createPrincipalsFromSubject(subject)
 
 	// Flags
 	token := ctx.String("token")
 	isAddUser := ctx.Bool("add-user")
 	force := ctx.Bool("force")
 	validAfter, validBefore, err := flags.ParseTimeDuration(ctx)
+	if err != nil {
+		return err
+	}
+	templateData, err := flags.ParseTemplateData(ctx)
 	if err != nil {
 		return err
 	}
@@ -190,7 +202,6 @@ func loginAction(ctx *cli.Context) error {
 	// provisioner is responsible for setting default principals by using an
 	// identity function.
 	if email, ok := tokenHasEmail(token); ok {
-		principals = []string{}
 		subject = email
 	}
 
@@ -199,10 +210,12 @@ func loginAction(ctx *cli.Context) error {
 		OTT:              token,
 		Principals:       principals,
 		CertType:         provisioner.SSHUserCert,
+		KeyID:            subject,
 		ValidAfter:       validAfter,
 		ValidBefore:      validBefore,
 		AddUserPublicKey: sshAuPubBytes,
 		IdentityCSR:      identityCSR,
+		TemplateData:     templateData,
 	})
 	if err != nil {
 		return err
