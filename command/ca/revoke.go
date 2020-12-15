@@ -3,6 +3,8 @@ package ca
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/pem"
+	"io/ioutil"
 	"net/http"
 	"os"
 	"strconv"
@@ -125,11 +127,14 @@ $ step ca revoke --offline --cert foo.crt --key foo.key
 				Usage: `The <path> to the key corresponding to the cert that should be revoked.`,
 			},
 			cli.StringFlag{
+				Name:  "reason",
+				Usage: `The <string> representing the reason for which the cert is being revoked.`,
+			},
+			cli.StringFlag{
 				Name:  "reasonCode",
 				Value: "",
 				Usage: `The <reasonCode> specifies the reason for revocation - chose from a list of
 common revocation reasons. If unset, the default is Unspecified.
-
 
 : <reasonCode> can be a number from 0-9 or a case insensitive string matching
 one of the following options:
@@ -178,10 +183,6 @@ Note: This is specific to the CertificateHold reason and is only used in DeltaCR
     :   It is known or suspected that aspects of the AA validated in the
 attribute certificate have been compromised (reasonCode=10).
 `,
-			},
-			cli.StringFlag{
-				Name:  "reason",
-				Usage: `The <string> representing the reason for which the cert is being revoked.`,
 			},
 			flags.CaConfig,
 			flags.CaURL,
@@ -306,8 +307,11 @@ func (f *revokeFlow) getClient(ctx *cli.Context, serial, token string) (cautils.
 	}
 
 	// Create online client
+	caURL, err := flags.ParseCaURLIfExists(ctx)
+	if err != nil {
+		return nil, err
+	}
 	rootFile := ctx.String("root")
-	caURL := ctx.String("ca-url")
 	var options []ca.ClientOption
 
 	if len(token) > 0 {
@@ -332,11 +336,13 @@ func (f *revokeFlow) getClient(ctx *cli.Context, serial, token string) (cautils.
 			ui.PrintSelected("CA", caURL)
 			return ca.NewClient(caURL, options...)
 		}
+	} else {
+		// If there is no token then caURL is required.
+		if len(caURL) == 0 {
+			return nil, errs.RequiredFlag(ctx, "ca-url")
+		}
 	}
 
-	if len(caURL) == 0 {
-		return nil, errs.RequiredFlag(ctx, "ca-url")
-	}
 	if len(rootFile) == 0 {
 		rootFile = pki.GetRootCAPath()
 		if _, err := os.Stat(rootFile); err != nil {
@@ -356,8 +362,10 @@ func (f *revokeFlow) GenerateToken(ctx *cli.Context, subject *string) (string, e
 	}
 
 	// Use online CA to get the provisioners and generate the token
-	caURL := ctx.String("ca-url")
-	if len(caURL) == 0 {
+	caURL, err := flags.ParseCaURLIfExists(ctx)
+	if err != nil {
+		return "", err
+	} else if len(caURL) == 0 {
 		return "", errs.RequiredUnlessFlag(ctx, "ca-url", "token")
 	}
 
@@ -369,7 +377,6 @@ func (f *revokeFlow) GenerateToken(ctx *cli.Context, subject *string) (string, e
 		}
 	}
 
-	var err error
 	if *subject == "" {
 		*subject, err = ui.Prompt("What is the Serial Number of the certificate you would like to revoke? (`step certificate inspect foo.cert`)", ui.WithValidateNotEmpty())
 		if err != nil {
@@ -399,11 +406,22 @@ func (f *revokeFlow) Revoke(ctx *cli.Context, serial, token string) error {
 	if len(token) == 0 {
 		certFile, keyFile := ctx.String("cert"), ctx.String("key")
 
-		// If there is no token then we must be doing a Revoke over mTLS.
-		var cert tls.Certificate
-		cert, err = tls.LoadX509KeyPair(certFile, keyFile)
+		certPEMBytes, err := ioutil.ReadFile(certFile)
 		if err != nil {
-			return errors.Wrap(err, "error loading certificates")
+			return errors.Wrap(err, "error reading certificate")
+		}
+		key, err := pemutil.Read(keyFile)
+		if err != nil {
+			return errors.Wrap(err, "error parsing key")
+		}
+		keyBlock, err := pemutil.Serialize(key)
+		if err != nil {
+			return errors.Wrap(err, "error serializing key")
+		}
+
+		cert, err := tls.X509KeyPair(certPEMBytes, pem.EncodeToMemory(keyBlock))
+		if err != nil {
+			return errors.Wrap(err, "error loading certificate key pair")
 		}
 		if len(cert.Certificate) == 0 {
 			return errors.New("error loading certificate: certificate chain is empty")

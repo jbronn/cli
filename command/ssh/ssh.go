@@ -2,6 +2,7 @@ package ssh
 
 import (
 	"net/http"
+	"strings"
 
 	"github.com/pkg/errors"
 	"github.com/smallstep/certificates/api"
@@ -11,6 +12,7 @@ import (
 	"github.com/smallstep/cli/command"
 	"github.com/smallstep/cli/crypto/keys"
 	"github.com/smallstep/cli/crypto/sshutil"
+	"github.com/smallstep/cli/flags"
 	"github.com/smallstep/cli/token"
 	"github.com/smallstep/cli/ui"
 	"github.com/smallstep/cli/utils/cautils"
@@ -101,7 +103,7 @@ $ ssh internal.example.com
 var (
 	sshPrincipalFlag = cli.StringSliceFlag{
 		Name: "principal,n",
-		Usage: `Add the specified principal (user or host) to the certificate request.
+		Usage: `Add the specified principal (user or host <name>s) to the certificate request.
 		This flag can be used multiple times. However, it cannot be used in conjunction
 		with '--token' when requesting certificates from OIDC, JWK, and X5C provisioners, or
 		from any provisioner with 'disableCustomSANs' set to 'true'. These provisioners will
@@ -148,6 +150,11 @@ private key so that the pair can be added to an SSH Agent.`,
 )
 
 func loginOnUnauthorized(ctx *cli.Context) (ca.RetryFunc, error) {
+	templateData, err := flags.ParseTemplateData(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	flow, err := cautils.NewCertificateFlow(ctx)
 	if err != nil {
 		return nil, err
@@ -198,10 +205,12 @@ func loginOnUnauthorized(ctx *cli.Context) (ca.RetryFunc, error) {
 		}
 
 		resp, err := client.SSHSign(&api.SSHSignRequest{
-			PublicKey:   sshPub.Marshal(),
-			OTT:         tok,
-			CertType:    provisioner.SSHUserCert,
-			IdentityCSR: *identityCSR,
+			PublicKey:    sshPub.Marshal(),
+			OTT:          tok,
+			CertType:     provisioner.SSHUserCert,
+			KeyID:        jwt.Payload.Email,
+			IdentityCSR:  *identityCSR,
+			TemplateData: templateData,
 		})
 		if err != nil {
 			return fail(err)
@@ -250,4 +259,20 @@ func debugErr(err error) error {
 		Err: err,
 		Msg: "An error occurred in the step process. Please contact an administrator.",
 	}
+}
+
+// createPrincipalsFromSubject create default principals names for a subject. By
+// default it would be the sanitized version of the subject, but if the subject
+// is an email it will add the local part if it's different and the email
+// address.
+func createPrincipalsFromSubject(subject string) []string {
+	name := provisioner.SanitizeSSHUserPrincipal(subject)
+	principals := []string{name}
+	if i := strings.LastIndex(subject, "@"); i >= 0 {
+		if local := subject[:i]; !strings.EqualFold(local, name) {
+			principals = append(principals, local)
+		}
+		principals = append(principals, subject)
+	}
+	return principals
 }

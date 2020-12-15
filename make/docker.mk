@@ -6,18 +6,29 @@
 # binary is copied to a new image that is optimized for size.
 #########################################
 
+ifeq (, $(shell which docker))
+	DOCKER_CLIENT_OS := linux
+else
+	DOCKER_CLIENT_OS := $(strip $(shell docker version -f '{{.Client.Os}}' 2>/dev/null))
+endif
+
+DOCKER_PLATFORMS = linux/amd64,linux/386,linux/arm,linux/arm64
+DOCKER_IMAGE_NAME = smallstep/step-cli
+
 docker-prepare:
 	# Ensure, we can build for ARM architecture
-	[ -f /proc/sys/fs/binfmt_misc/qemu-arm ] || docker run --rm --privileged docker/binfmt:a7996909642ee92942dcd6cff44b9b95f08dad64
+ifeq (linux,$(DOCKER_CLIENT_OS))
+	[ -f /proc/sys/fs/binfmt_misc/qemu-arm ] || docker run --rm --privileged linuxkit/binfmt:v0.8-amd64
+endif
 
 	# Register buildx builder
 	mkdir -p $$HOME/.docker/cli-plugins
 
-	wget -O $$HOME/.docker/cli-plugins/docker-buildx https://github.com/docker/buildx/releases/download/v0.3.1/buildx-v0.3.1.linux-amd64
-	chmod +x $$HOME/.docker/cli-plugins/docker-buildx
+	test -f $$HOME/.docker/cli-plugins/docker-buildx || \
+		(wget -q -O $$HOME/.docker/cli-plugins/docker-buildx https://github.com/docker/buildx/releases/download/v0.4.1/buildx-v0.4.1.$(DOCKER_CLIENT_OS)-amd64 && \
+		chmod +x $$HOME/.docker/cli-plugins/docker-buildx)
 
-	$$HOME/.docker/cli-plugins/docker-buildx create --name mybuilder --platform amd64 --platform arm || true
-	$$HOME/.docker/cli-plugins/docker-buildx use mybuilder
+	docker buildx create --use --name mybuilder --platform="$(DOCKER_PLATFORMS)" || true
 
 .PHONY: docker-prepare
 
@@ -39,21 +50,18 @@ docker-login:
 # Targets for different type of builds
 #################################################
 
-DOCKER_IMAGE_NAME = smallstep/step-cli
-PLATFORMS = --platform amd64 --platform 386 --platform arm
 
 define DOCKER_BUILDX
 	# $(1) -- Image Tag
 	# $(2) -- Push (empty is no push | --push will push to dockerhub)
-	$$HOME/.docker/cli-plugins/docker-buildx build . --progress plain -t $(DOCKER_IMAGE_NAME):$(1) -f docker/Dockerfile $(PLATFORMS) $(2)
+	docker buildx build . --progress plain -t $(DOCKER_IMAGE_NAME):$(1) -f docker/Dockerfile --platform="$(DOCKER_PLATFORMS)" $(2)
 endef
 
 # For non-master builds don't build the docker containers.
 docker-branch:
 
-# For master builds create the docker containers but don't push them.
-docker-master: docker-prepare
-	$(call DOCKER_BUILDX,latest,)
+# For master builds don't build the docker containers. Only build for releases.
+docker-master:
 
 # For all builds with a release candidate tag build and push the containers.
 docker-release-candidate: docker-prepare docker-login
